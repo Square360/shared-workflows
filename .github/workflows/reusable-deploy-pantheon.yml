@@ -173,10 +173,10 @@ jobs:
         if [[ "$PR_TITLE" == *"[config-first]"* ]]; then
           echo "🔧 Running config import first (detected [config-first] tag)"
           terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- cim -y
-          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y
+          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y -v
         else
           echo "🔧 Running database update first (default order)"
-          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y
+          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y -v
           terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- cim -y
         fi
 
