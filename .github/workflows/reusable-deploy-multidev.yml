@@ -155,19 +155,26 @@ jobs:
       env:
         TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
       run: |
-        # Check PR title for order preference
+        # Check PR title for order preference and verbosity
         # Use HERE document to safely handle all special characters
         read -r -d '' PR_TITLE <<'EOF' || true
         ${{ github.event.pull_request.title }}
         EOF
 
+        # Set -v flag only when [verbose] tag is present in PR title
+        UPDB_FLAGS="-y"
+        if [[ "$PR_TITLE" == *"[verbose]"* ]]; then
+          echo "🔍 Verbose updb enabled (detected [verbose] tag)"
+          UPDB_FLAGS="-y -v"
+        fi
+
         if [[ "$PR_TITLE" == *"[config-first]"* ]]; then
           echo "🔧 Running config import first (detected [config-first] tag)"
           terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- cim -y
-          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y -v
+          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb $UPDB_FLAGS
         else
           echo "🔧 Running database update first (default order)"
-          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb -y -v
+          terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- updb $UPDB_FLAGS
           terminus -n drush ${{ inputs.pantheon_site }}.${{ inputs.target_env }} -- cim -y
         fi
 
