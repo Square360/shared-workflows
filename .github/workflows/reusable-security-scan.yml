@@ -1,0 +1,724 @@
+name: Reusable Security Scan (OWASP ZAP Baseline)
+
+# -----------------------------------------------------------------------------
+# Modeled on reusable-visual-regression.yml.
+#
+# Runs an OWASP ZAP baseline scan against a deployed Pantheon multidev. Uploads
+# HTML + JSON + Markdown reports to the same S3 bucket VRT uses (new prefix
+# /security/) and posts a summary to the PR, an optional ClickUp task, and an
+# optional Slack channel.
+#
+# Gating:
+#   - pr-*  multidevs: opt-in via [security] or [security TASK-ID] in PR body.
+#                      Findings are reported but never fail the workflow.
+#   - rc-*  multidevs: always runs (release-candidate gate). Fails the job if
+#                      any High-severity alert is reported.
+#
+# LIVE is read-only: this workflow only scans pr-* / rc- multidev URLs. It must
+# never be pointed at a production environment.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      target_env:
+        description: 'Target environment name (e.g. rc-2025-12 or pr-42)'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications'
+        required: false
+        type: string
+      force_run:
+        description: 'Skip [security] tag check and run unconditionally (for manual triggers)'
+        required: false
+        type: boolean
+        default: false
+      pr_head_ref:
+        description: 'PR head branch name — used for ClickUp ID fallback on manual runs'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_S3_BUCKET:
+        required: true
+      AWS_S3_REGION:
+        required: false
+      CLICKUP_API_TOKEN:
+        required: false
+      CLICKUP_TEAM_ID:
+        required: false
+      SLACK_BOT_TOKEN:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  security_scan:
+    name: OWASP ZAP Baseline Scan
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+
+    # -------------------------------------------------------------------------
+    # Step 1: Decide whether to run.
+    #
+    # rc-* environments: always run. The [security] tag is ignored.
+    # pr-* environments: opt-in. The PR body must contain [security] or
+    #                    [security TASK-ID]. If absent, the job exits cleanly.
+    #
+    # Also resolves a ClickUp task ID from the tag itself or from the branch
+    # name (e.g. feature/ymac-959-foo → YMAC-959).
+    # -------------------------------------------------------------------------
+    - name: Parse [security] tag and decide whether to run
+      id: sec_check
+      # All attacker-controllable values (PR body, branch name) are routed
+      # through env vars so they're never interpolated directly into the
+      # shell script. See:
+      # https://docs.github.com/en/actions/reference/security/secure-use
+      env:
+        PR_BODY:         ${{ github.event.pull_request.body }}
+        TARGET_ENV:      ${{ inputs.target_env }}
+        FORCE_RUN:       ${{ inputs.force_run }}
+        PR_HEAD_REF:     ${{ inputs.pr_head_ref }}
+        GH_HEAD_REF:     ${{ github.head_ref }}
+        # GITHUB_REF_NAME is set automatically by the runner; no need to declare.
+      run: |
+        # Resolve the branch name in priority order — input wins, then the PR
+        # head_ref, then the bare ref name. All come from env so the shell
+        # never sees raw expression-substituted text.
+        BRANCH="${PR_HEAD_REF:-${GH_HEAD_REF:-$GITHUB_REF_NAME}}"
+
+        # Mandatory on rc-* release candidate environments.
+        if [[ "$TARGET_ENV" == rc-* ]]; then
+          echo "rc-* target_env — security scan is mandatory"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "severity_mode=strict" >> "$GITHUB_OUTPUT"
+          # rc- runs don't expect a PR body tag, but we still try to find a
+          # ClickUp ID for the comment from the branch name.
+          TASK_ID=$(echo "$BRANCH" | grep -oiP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          echo "clickup_task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+          echo "ClickUp task ID: ${TASK_ID:-none}"
+          exit 0
+        fi
+
+        # Manual trigger override (callable from workflow_dispatch wrappers).
+        if [[ "$FORCE_RUN" == "true" ]]; then
+          echo "Manual trigger — skipping [security] tag check"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "severity_mode=lenient" >> "$GITHUB_OUTPUT"
+          TASK_ID=$(echo "${PR_HEAD_REF}" | grep -oiP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          echo "clickup_task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+          echo "ClickUp task ID: ${TASK_ID:-none}"
+          exit 0
+        fi
+
+        # pr-* opt-in via PR body tag.
+        if [[ -z "$PR_BODY" ]] || ! echo "$PR_BODY" | grep -qP '\[security\b'; then
+          echo "No [security] tag found in PR body — skipping security scan"
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
+        echo "severity_mode=lenient" >> "$GITHUB_OUTPUT"
+        echo "[security] tag detected"
+
+        # Optional ClickUp task ID inside the tag: [security YMAC-959]
+        TASK_ID=$(echo "$PR_BODY" | grep -oP '\[security\s+([A-Z][A-Z0-9]+-[0-9]+)' | grep -oP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+
+        # Fallback: scan branch name (e.g. feature/ymac-959-my-feature → YMAC-959)
+        if [[ -z "$TASK_ID" ]]; then
+          TASK_ID=$(echo "$BRANCH" | grep -oiP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          if [[ -n "$TASK_ID" ]]; then
+            echo "ClickUp task ID resolved from branch name: ${TASK_ID}"
+          fi
+        fi
+
+        echo "clickup_task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+        echo "ClickUp task ID: ${TASK_ID:-none}"
+
+    - name: Checkout
+      if: steps.sec_check.outputs.enabled == 'true'
+      uses: actions/checkout@v6
+
+    - name: Install Terminus
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+      run: |
+        TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+        curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" \
+          -o /usr/local/bin/terminus
+        chmod +x /usr/local/bin/terminus
+        terminus auth:login --machine-token="$TERMINUS_MACHINE_TOKEN"
+
+    # -------------------------------------------------------------------------
+    # Resolve the multidev URL and assert it's not LIVE. This is principle zero:
+    # LIVE is read-only from our tools, and a security scanner has no business
+    # probing production.
+    # -------------------------------------------------------------------------
+    - name: Get multidev URL
+      id: get_url
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        TARGET_ENV: ${{ inputs.target_env }}
+      run: |
+        if [[ "$TARGET_ENV" == "live" ]]; then
+          echo "Refusing to run a security scan against LIVE. This workflow is multidev-only."
+          exit 1
+        fi
+
+        TARGET_URL=$(terminus env:view ${{ inputs.pantheon_site }}.${{ inputs.target_env }} --print 2>/dev/null \
+          | grep -oE 'https?://[^[:space:]]+' | head -1 | tr -d '[:space:]')
+
+        if [[ -z "$TARGET_URL" ]]; then
+          echo "Error: could not get URL from Terminus for ${{ inputs.pantheon_site }}.${{ inputs.target_env }}"
+          exit 1
+        fi
+
+        echo "target_url=${TARGET_URL}" >> "$GITHUB_OUTPUT"
+        echo "Target URL: ${TARGET_URL}"
+
+    # -------------------------------------------------------------------------
+    # Compute S3 URLs up front (matches VRT pattern). Reports land under the
+    # same RUN_KEY as VRT so all artefacts for one PR push are grouped, with
+    # a /security/ subfolder to avoid collision.
+    # -------------------------------------------------------------------------
+    - name: Compute S3 URLs
+      id: s3_urls
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        AWS_S3_BUCKET:       ${{ secrets.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT: ${{ secrets.AWS_S3_REGION }}
+        PANTHEON_SITE:       ${{ inputs.pantheon_site }}
+      run: |
+        REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
+        RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        BASE_URL="https://${AWS_S3_BUCKET}.s3.${REGION}.amazonaws.com/${PANTHEON_SITE}/${RUN_KEY}/security"
+        echo "base_url=${BASE_URL}" >> "$GITHUB_OUTPUT"
+        echo "run_key=${RUN_KEY}"   >> "$GITHUB_OUTPUT"
+        echo "region=${REGION}"     >> "$GITHUB_OUTPUT"
+        echo "S3 base URL: ${BASE_URL}"
+
+    # -------------------------------------------------------------------------
+    # Wait for the target multidev to actually be serving traffic before we
+    # point ZAP at it. Even when this job has `needs: [deploy_multidev]` in
+    # the consumer template, Pantheon can briefly return 5xx from its load
+    # balancer between "deploy step finished" and "container is serving".
+    # Without this check, ZAP would happily scan a dead URL, produce an empty
+    # site report, and we'd post a misleading "✅ No findings" comment.
+    #
+    # 2xx/3xx/4xx are all proof-of-life (the app is responding, even with a
+    # redirect or auth challenge). 5xx is treated as "still provisioning" and
+    # retried. 60-second total budget (12 attempts × 5s sleep).
+    # -------------------------------------------------------------------------
+    - name: Wait for target to be reachable
+      id: reachability
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        TARGET_URL: ${{ steps.get_url.outputs.target_url }}
+      run: |
+        set -euo pipefail
+        MAX_ATTEMPTS=12
+        SLEEP_SECS=5
+        STATUS="000"
+
+        echo "Probing ${TARGET_URL} for reachability (up to $((MAX_ATTEMPTS * SLEEP_SECS))s)..."
+        for i in $(seq 1 "$MAX_ATTEMPTS"); do
+          STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 10 "$TARGET_URL" 2>/dev/null || echo "000")
+          if [[ "$STATUS" =~ ^[234][0-9][0-9]$ ]]; then
+            echo "✓ Target is responding (HTTP ${STATUS}) after attempt ${i}/${MAX_ATTEMPTS}"
+            echo "final_status=${STATUS}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "  attempt ${i}/${MAX_ATTEMPTS}: HTTP ${STATUS:-unknown} — sleeping ${SLEEP_SECS}s..."
+          sleep "$SLEEP_SECS"
+        done
+
+        echo "::error::Target ${TARGET_URL} did not return a reachable HTTP status (2xx/3xx/4xx) within $((MAX_ATTEMPTS * SLEEP_SECS))s. Last status: ${STATUS}. The multidev may have failed to provision or the deploy left it in a bad state."
+        echo "final_status=${STATUS}" >> "$GITHUB_OUTPUT"
+        exit 1
+
+    # -------------------------------------------------------------------------
+    # Run the OWASP ZAP baseline scan.
+    #
+    # Action: zaproxy/action-baseline@v0.14.0 — actively maintained by the OWASP
+    # ZAP project. Wraps zap-baseline.py inside an official ZAP Docker image
+    # and emits report_html.html, report_md.md, report_json.json.
+    #
+    # fail_action: false   — we never let the action itself fail the job. The
+    #                        env-aware assert step below decides the verdict.
+    # cmd_options: -I       — do not return an error code for warning-only
+    #                        findings (we make our own severity decision).
+    # -------------------------------------------------------------------------
+    - name: Run OWASP ZAP baseline scan
+      id: run_zap
+      if: steps.sec_check.outputs.enabled == 'true'
+      uses: zaproxy/action-baseline@v0.14.0
+      with:
+        target: ${{ steps.get_url.outputs.target_url }}
+        fail_action: false
+        allow_issue_writing: false
+        cmd_options: '-I'
+
+    # -------------------------------------------------------------------------
+    # Summarise the ZAP JSON report into severity counts for use by the assert,
+    # PR comment, ClickUp comment, and Slack notify steps.
+    # -------------------------------------------------------------------------
+    - name: Summarise ZAP findings
+      id: summarise
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        TARGET_ENV: ${{ inputs.target_env }}
+        TARGET_URL: ${{ steps.get_url.outputs.target_url }}
+        S3_BASE_URL: ${{ steps.s3_urls.outputs.base_url }}
+        SEVERITY_MODE: ${{ steps.sec_check.outputs.severity_mode }}
+      run: |
+        # The action writes report_json.json to the workspace root.
+        if [[ ! -f report_json.json ]]; then
+          echo "report_json.json not found — ZAP action did not produce output"
+          echo "scan_status=missing_report" >> "$GITHUB_OUTPUT"
+          echo "high=0"   >> "$GITHUB_OUTPUT"
+          echo "medium=0" >> "$GITHUB_OUTPUT"
+          echo "low=0"    >> "$GITHUB_OUTPUT"
+          echo "info=0"   >> "$GITHUB_OUTPUT"
+          echo "total=0"  >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Detect scans that produced an empty .site[] array. The reachability
+        # check earlier in this workflow should have caught a dead target, but
+        # if the URL becomes unreachable mid-scan ZAP will still emit a JSON
+        # report with no sites. Surface that as "inconclusive" rather than
+        # silently reporting "no findings" — false negatives are worse than
+        # honest failures.
+        SITE_COUNT=$(jq '.site | length' report_json.json)
+        if [[ "$SITE_COUNT" -eq 0 ]]; then
+          echo "::warning::ZAP produced an empty site list — target was likely unreachable during the scan. Treating result as inconclusive."
+          SCAN_STATUS="inconclusive"
+        else
+          SCAN_STATUS="ok"
+        fi
+        echo "scan_status=${SCAN_STATUS}"   >> "$GITHUB_OUTPUT"
+        echo "site_count=${SITE_COUNT}"     >> "$GITHUB_OUTPUT"
+
+        # ZAP riskcode: 3=High, 2=Medium, 1=Low, 0=Informational
+        HIGH=$(jq   '[.site[]?.alerts[]? | select(.riskcode == "3")] | length' report_json.json)
+        MEDIUM=$(jq '[.site[]?.alerts[]? | select(.riskcode == "2")] | length' report_json.json)
+        LOW=$(jq    '[.site[]?.alerts[]? | select(.riskcode == "1")] | length' report_json.json)
+        INFO=$(jq   '[.site[]?.alerts[]? | select(.riskcode == "0")] | length' report_json.json)
+        TOTAL=$((HIGH + MEDIUM + LOW + INFO))
+
+        echo "high=${HIGH}"     >> "$GITHUB_OUTPUT"
+        echo "medium=${MEDIUM}" >> "$GITHUB_OUTPUT"
+        echo "low=${LOW}"       >> "$GITHUB_OUTPUT"
+        echo "info=${INFO}"     >> "$GITHUB_OUTPUT"
+        echo "total=${TOTAL}"   >> "$GITHUB_OUTPUT"
+
+        echo "ZAP findings — Status: $SCAN_STATUS, Sites: $SITE_COUNT, High: $HIGH, Medium: $MEDIUM, Low: $LOW, Info: $INFO"
+
+        # Build a Markdown alert table for the PR comment (GitHub renders these).
+        jq -r '
+          [.site[]?.alerts[]?
+            | {
+                risk:     (.riskdesc // ""),
+                riskcode: (.riskcode // "0"),
+                name:     (.name // ""),
+                count:    ((.instances // []) | length)
+              }
+          ]
+          | sort_by(-(.riskcode | tonumber))
+          | (["| Risk | Alert | Instances |", "|:--|---|---:|"] + (map("| \(.risk) | \(.name) | \(.count) |"))) | .[]
+        ' report_json.json > zap-summary.md
+
+        if [[ ! -s zap-summary.md ]]; then
+          echo "_No alerts reported._" > zap-summary.md
+        fi
+
+        # Build a High-severity-only bullet list for the ClickUp comment.
+        # ClickUp does not render GFM tables but does render bullets, and Highs
+        # are the only items worth surfacing inline — the full detail lives in
+        # the linked HTML report.
+        jq -r '
+          [.site[]?.alerts[]?
+            | select(.riskcode == "3")
+            | {
+                name:  (.name // ""),
+                count: ((.instances // []) | length)
+              }
+          ]
+          | sort_by(.name)
+          | map("- \(.name) (\(.count) instance\(if .count == 1 then "" else "s" end))")
+          | .[]
+        ' report_json.json > zap-high-bullets.md
+
+        # Leave the file empty when there are no High findings — the ClickUp
+        # step uses [[ -s zap-high-bullets.md ]] to decide whether to include
+        # the block at all.
+
+    - name: Upload ZAP reports to S3
+      id: s3_upload
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_S3_BUCKET:         ${{ secrets.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT:   ${{ secrets.AWS_S3_REGION }}
+        PANTHEON_SITE:         ${{ inputs.pantheon_site }}
+        RUN_KEY:               ${{ steps.s3_urls.outputs.run_key }}
+        BASE_URL:              ${{ steps.s3_urls.outputs.base_url }}
+      run: |
+        set -euo pipefail
+
+        AWS_DEFAULT_REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
+        export AWS_DEFAULT_REGION
+
+        S3_PREFIX="s3://${AWS_S3_BUCKET}/${PANTHEON_SITE}/${RUN_KEY}/security"
+
+        # Quick local debug: log what's actually in the workspace so a future
+        # filename change in the ZAP action shows up plainly in the run log
+        # instead of as a silent "no files uploaded" mystery.
+        echo "Workspace report-ish files:"
+        ls -la report*.* zap-*.md 2>/dev/null || echo "  (no matching files found)"
+        echo ""
+
+        # Build the upload candidate list from any report_*.{html,md,json} the
+        # ZAP action produced, plus the summaries we generated ourselves. Using
+        # globs (not a hardcoded list) so an upstream filename change is caught.
+        shopt -s nullglob
+        CANDIDATES=( report_*.html report_*.md report_*.json zap-summary.md zap-high-bullets.md )
+        shopt -u nullglob
+
+        UPLOADED=()
+        UPLOADED_HTML=""
+        UPLOADED_JSON=""
+        UPLOADED_MD=""
+
+        for f in "${CANDIDATES[@]}"; do
+          [[ -f "$f" ]] || continue
+          case "$f" in
+            *.html) CT="text/html" ;;
+            *.json) CT="application/json" ;;
+            *.md)   CT="text/markdown" ;;
+            *)      CT="application/octet-stream" ;;
+          esac
+          aws s3 cp "$f" "${S3_PREFIX}/${f}" --content-type "$CT" --quiet
+          echo "  uploaded: ${f}"
+          UPLOADED+=("$f")
+
+          # Track the canonical report files by extension for the URL outputs.
+          case "$f" in
+            report_*.html) UPLOADED_HTML="$f" ;;
+            report_*.json) UPLOADED_JSON="$f" ;;
+            report_*.md)   UPLOADED_MD="$f"   ;;
+          esac
+        done
+
+        if [[ ${#UPLOADED[@]} -eq 0 ]]; then
+          echo "::error::No ZAP report files were uploaded — the action may have changed its output names or produced nothing. Check the 'Run OWASP ZAP baseline scan' step output."
+          exit 1
+        fi
+
+        echo "Uploaded ${#UPLOADED[@]} file(s) to ${S3_PREFIX}/"
+
+        # Only emit URL outputs for files that actually uploaded. Downstream
+        # steps check `!= ''` and skip cleanly when a report variant is absent.
+        if [[ -n "$UPLOADED_HTML" ]]; then
+          echo "report_html_url=${BASE_URL}/${UPLOADED_HTML}" >> "$GITHUB_OUTPUT"
+          echo "HTML report: ${BASE_URL}/${UPLOADED_HTML}"
+        fi
+        if [[ -n "$UPLOADED_JSON" ]]; then
+          echo "report_json_url=${BASE_URL}/${UPLOADED_JSON}" >> "$GITHUB_OUTPUT"
+          echo "JSON report: ${BASE_URL}/${UPLOADED_JSON}"
+        fi
+        if [[ -n "$UPLOADED_MD" ]]; then
+          echo "report_md_url=${BASE_URL}/${UPLOADED_MD}" >> "$GITHUB_OUTPUT"
+          echo "Markdown report: ${BASE_URL}/${UPLOADED_MD}"
+        fi
+
+    # -------------------------------------------------------------------------
+    # Post the summary to the PR (matches VRT comment style).
+    # -------------------------------------------------------------------------
+    - name: Comment on PR
+      if: steps.sec_check.outputs.enabled == 'true' && github.event.pull_request.number != ''
+      uses: actions/github-script@v8
+      env:
+        REPORT_HTML_URL: ${{ steps.s3_upload.outputs.report_html_url }}
+        REPORT_JSON_URL: ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:      ${{ inputs.target_env }}
+        TARGET_URL:      ${{ steps.get_url.outputs.target_url }}
+        HIGH:            ${{ steps.summarise.outputs.high }}
+        MEDIUM:          ${{ steps.summarise.outputs.medium }}
+        LOW:             ${{ steps.summarise.outputs.low }}
+        INFO:            ${{ steps.summarise.outputs.info }}
+        TOTAL:           ${{ steps.summarise.outputs.total }}
+        SEVERITY_MODE:   ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:     ${{ steps.summarise.outputs.scan_status }}
+      with:
+        script: |
+          const fs    = require('fs');
+          const table = fs.existsSync('zap-summary.md')
+            ? fs.readFileSync('zap-summary.md', 'utf8')
+            : '_No summary available._';
+
+          const high   = parseInt(process.env.HIGH   || '0', 10);
+          const medium = parseInt(process.env.MEDIUM || '0', 10);
+          const low    = parseInt(process.env.LOW    || '0', 10);
+          const info   = parseInt(process.env.INFO   || '0', 10);
+          const total  = parseInt(process.env.TOTAL  || '0', 10);
+          const mode   = process.env.SEVERITY_MODE || 'lenient';
+          const status = process.env.SCAN_STATUS || 'ok';
+
+          let icon, statusText;
+          if (status === 'inconclusive') {
+            icon = '⚠️'; statusText = 'Scan inconclusive — target was not reachable during the scan';
+          } else if (status === 'missing_report') {
+            icon = '⚠️'; statusText = 'Scan inconclusive — ZAP produced no report';
+          } else if (total === 0) {
+            icon = '✅'; statusText = 'No findings';
+          } else if (high > 0 && mode === 'strict') {
+            icon = '❌'; statusText = `${high} High severity finding(s) — release candidate gate failed`;
+          } else if (high > 0) {
+            icon = '⚠️'; statusText = `${high} High severity finding(s) — review before merge`;
+          } else {
+            icon = 'ℹ️'; statusText = `${total} finding(s) — informational`;
+          }
+
+          const body = [
+            `## ${icon} OWASP ZAP Baseline Scan — ${statusText}`,
+            '',
+            `**High:** ${high} · **Medium:** ${medium} · **Low:** ${low} · **Info:** ${info}`,
+            '',
+            table,
+            '',
+            `[📊 View Full HTML Report](${process.env.REPORT_HTML_URL})`,
+            `[🤖 AI-readable JSON report](${process.env.REPORT_JSON_URL})`,
+            '',
+            `> Target: \`${process.env.TARGET_ENV}\` — ${process.env.TARGET_URL}`,
+            '',
+            '---',
+            '**Security scan interpretation note:**',
+            'Baseline scans are passive checks against the running multidev. Findings flag potential issues — not all are bugs. Reviewers should prioritise High-severity findings and verify each in context. Configuration drift (missing security headers, cookie flags) is often the highest-value signal here.',
+          ].join('\n');
+
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body,
+          });
+
+    # -------------------------------------------------------------------------
+    # Post to ClickUp task. Skipped gracefully if secrets missing or task ID
+    # wasn't resolved from the [security TASK-ID] tag or branch name.
+    # -------------------------------------------------------------------------
+    - name: Comment on ClickUp task
+      if: >
+        steps.sec_check.outputs.enabled == 'true' &&
+        steps.sec_check.outputs.clickup_task_id != ''
+      continue-on-error: true
+      env:
+        CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        CLICKUP_TEAM_ID:   ${{ secrets.CLICKUP_TEAM_ID }}
+        TASK_ID:           ${{ steps.sec_check.outputs.clickup_task_id }}
+        REPORT_HTML_URL:   ${{ steps.s3_upload.outputs.report_html_url }}
+        REPORT_JSON_URL:   ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:        ${{ inputs.target_env }}
+        TARGET_URL:        ${{ steps.get_url.outputs.target_url }}
+        HIGH:              ${{ steps.summarise.outputs.high }}
+        MEDIUM:            ${{ steps.summarise.outputs.medium }}
+        LOW:               ${{ steps.summarise.outputs.low }}
+        INFO:              ${{ steps.summarise.outputs.info }}
+        TOTAL:             ${{ steps.summarise.outputs.total }}
+        SEVERITY_MODE:     ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:       ${{ steps.summarise.outputs.scan_status }}
+      run: |
+        if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
+          echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set — skipping ClickUp comment"
+          exit 0
+        fi
+
+        if [[ "$SCAN_STATUS" == "inconclusive" ]]; then
+          ICON="⚠️"; HEADER="OWASP ZAP Baseline Scan — Inconclusive (target unreachable during scan)"
+        elif [[ "$SCAN_STATUS" == "missing_report" ]]; then
+          ICON="⚠️"; HEADER="OWASP ZAP Baseline Scan — Inconclusive (ZAP produced no report)"
+        elif [[ "$TOTAL" == "0" ]]; then
+          ICON="✅"; HEADER="OWASP ZAP Baseline Scan — No findings"
+        elif [[ "$HIGH" != "0" && "$SEVERITY_MODE" == "strict" ]]; then
+          ICON="❌"; HEADER="OWASP ZAP Baseline Scan — ${HIGH} High finding(s) — RC gate failed"
+        elif [[ "$HIGH" != "0" ]]; then
+          ICON="⚠️"; HEADER="OWASP ZAP Baseline Scan — ${HIGH} High finding(s) — review before merge"
+        else
+          ICON="ℹ️"; HEADER="OWASP ZAP Baseline Scan — ${TOTAL} finding(s) (informational)"
+        fi
+
+        # Build the comment body. ClickUp does not render GFM tables, so the
+        # full alert table is intentionally skipped here — the HTML report has
+        # all of that. Only High-severity items are surfaced inline (as
+        # bullets, which ClickUp does render), and only when there are any.
+        #
+        # Using a brace group of echo statements rather than a heredoc —
+        # heredoc body lines would need to sit at column 0, which breaks the
+        # YAML block scalar indentation.
+        {
+          echo "${ICON} ${HEADER}"
+          echo ""
+          echo "High: ${HIGH}  ·  Medium: ${MEDIUM}  ·  Low: ${LOW}  ·  Info: ${INFO}"
+          echo ""
+          if [[ -s zap-high-bullets.md ]]; then
+            echo "High-severity findings:"
+            cat zap-high-bullets.md
+            echo ""
+          fi
+          echo "Environment : ${TARGET_ENV}"
+          echo "Target URL  : ${TARGET_URL}"
+          if [[ -n "${REPORT_HTML_URL}" ]]; then
+            echo "HTML report : ${REPORT_HTML_URL}"
+          fi
+          if [[ -n "${REPORT_JSON_URL}" ]]; then
+            echo "JSON report : ${REPORT_JSON_URL}"
+          fi
+          echo ""
+          echo "---"
+          echo "Security scan interpretation note:"
+          echo "Baseline scans are passive checks against the running multidev. Findings flag potential issues — not all are bugs. Reviewers should prioritise High-severity findings and verify each in context. Configuration drift (missing security headers, cookie flags) is often the highest-value signal here."
+        } > /tmp/sec_comment.txt
+        COMMENT_TEXT=$(cat /tmp/sec_comment.txt)
+
+        RESPONSE=$(curl -s -o /tmp/cu_sec_response.json -w "%{http_code}" -X POST \
+          "https://api.clickup.com/api/v2/task/${TASK_ID}/comment?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}" \
+          -H "Authorization: ${CLICKUP_API_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg text "$COMMENT_TEXT" '{"comment_text": $text}')")
+
+        echo "ClickUp API response: ${RESPONSE}"
+        cat /tmp/cu_sec_response.json || true
+        if [[ "$RESPONSE" != "200" ]]; then
+          echo "Warning: ClickUp comment may not have posted (HTTP ${RESPONSE})"
+        fi
+
+    # -------------------------------------------------------------------------
+    # Assert severity AFTER comments are posted so a failed rc-* run still
+    # notifies. pr-* runs never fail here; rc-* runs fail if any High.
+    # -------------------------------------------------------------------------
+    - name: Assert severity (rc-* fails on High)
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        SEVERITY_MODE: ${{ steps.sec_check.outputs.severity_mode }}
+        HIGH:          ${{ steps.summarise.outputs.high }}
+      run: |
+        if [[ "$SEVERITY_MODE" == "strict" && "$HIGH" != "0" ]]; then
+          echo "❌ ${HIGH} High-severity finding(s) detected on a release-candidate environment."
+          exit 1
+        fi
+        echo "✅ Severity assertion passed (mode: ${SEVERITY_MODE}, High: ${HIGH})"
+
+    # -------------------------------------------------------------------------
+    # Slack notification. Runs always() so a failed rc-* assert still notifies.
+    # -------------------------------------------------------------------------
+    - name: Notify Slack
+      if: >
+        always() &&
+        steps.sec_check.outputs.enabled == 'true' &&
+        inputs.slack_channel != ''
+      env:
+        SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+        SLACK_CHANNEL:    ${{ inputs.slack_channel }}
+        REPORT_HTML_URL:  ${{ steps.s3_upload.outputs.report_html_url }}
+        REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:       ${{ inputs.target_env }}
+        PANTHEON_SITE:    ${{ inputs.pantheon_site }}
+        HIGH:             ${{ steps.summarise.outputs.high }}
+        MEDIUM:           ${{ steps.summarise.outputs.medium }}
+        LOW:              ${{ steps.summarise.outputs.low }}
+        INFO:             ${{ steps.summarise.outputs.info }}
+        TOTAL:            ${{ steps.summarise.outputs.total }}
+        SEVERITY_MODE:    ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:      ${{ steps.summarise.outputs.scan_status }}
+      run: |
+        if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+          echo "SLACK_BOT_TOKEN not set — skipping Slack notification"
+          exit 0
+        fi
+
+        if [[ "$SCAN_STATUS" == "inconclusive" ]]; then
+          STATUS_EMOJI=":warning:"
+          STATUS_COLOR="warning"
+          STATUS_TEXT="Inconclusive — target unreachable during scan"
+        elif [[ "$SCAN_STATUS" == "missing_report" ]]; then
+          STATUS_EMOJI=":warning:"
+          STATUS_COLOR="warning"
+          STATUS_TEXT="Inconclusive — ZAP produced no report"
+        elif [[ "$TOTAL" == "0" ]]; then
+          STATUS_EMOJI=":white_check_mark:"
+          STATUS_COLOR="good"
+          STATUS_TEXT="No findings"
+        elif [[ "$HIGH" != "0" && "$SEVERITY_MODE" == "strict" ]]; then
+          STATUS_EMOJI=":x:"
+          STATUS_COLOR="danger"
+          STATUS_TEXT="${HIGH} High finding(s) — RC gate failed"
+        elif [[ "$HIGH" != "0" ]]; then
+          STATUS_EMOJI=":warning:"
+          STATUS_COLOR="warning"
+          STATUS_TEXT="${HIGH} High finding(s) — review before merge"
+        else
+          STATUS_EMOJI=":information_source:"
+          STATUS_COLOR="#808080"
+          STATUS_TEXT="${TOTAL} finding(s) (informational)"
+        fi
+
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        REPO="${{ github.repository }}"
+        PR_FIELD=""
+        if [[ -n "$PR_NUMBER" ]]; then
+          PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": true}"
+        fi
+
+        REPORT_FIELD=""
+        if [[ -n "$REPORT_HTML_URL" ]]; then
+          REPORT_FIELD=",{\"title\": \"Report\", \"value\": \"<${REPORT_HTML_URL}|View Full Report>\", \"short\": false}"
+        fi
+
+        REPORT_JSON_FIELD=""
+        if [[ -n "$REPORT_JSON_URL" ]]; then
+          REPORT_JSON_FIELD=",{\"title\": \"AI-readable JSON\", \"value\": \"<${REPORT_JSON_URL}|report_json.json>\", \"short\": false}"
+        fi
+
+        NOTE_FIELD=",{\"title\": \"Security scan interpretation note\", \"value\": \"Baseline scans are passive checks against the running multidev. Findings flag potential issues — not all are bugs. Reviewers should prioritise High-severity findings and verify each in context. Configuration drift (missing security headers, cookie flags) is often the highest-value signal here.\", \"short\": false}"
+
+        curl -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+          -H 'Content-type: application/json; charset=utf-8' \
+          --data "{
+            \"channel\": \"${SLACK_CHANNEL}\",
+            \"text\": \"${STATUS_EMOJI} OWASP ZAP Baseline Scan — ${STATUS_TEXT}\",
+            \"attachments\": [{
+              \"color\": \"${STATUS_COLOR}\",
+              \"fields\": [
+                {\"title\": \"Site\",        \"value\": \"${PANTHEON_SITE}\", \"short\": true},
+                {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\",    \"short\": true},
+                {\"title\": \"Findings\",    \"value\": \"High: ${HIGH}  ·  Medium: ${MEDIUM}  ·  Low: ${LOW}  ·  Info: ${INFO}\", \"short\": false}
+                ${PR_FIELD}
+                ${REPORT_FIELD}
+                ${REPORT_JSON_FIELD}
+                ${NOTE_FIELD}
+              ],
+              \"footer\": \"GitHub Actions\",
+              \"ts\": $(date +%s)
+            }]
+          }" \
+          https://slack.com/api/chat.postMessage
