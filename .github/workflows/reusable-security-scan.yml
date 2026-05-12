@@ -276,7 +276,7 @@ jobs:
 
         echo "ZAP findings — High: $HIGH, Medium: $MEDIUM, Low: $LOW, Info: $INFO"
 
-        # Build a Markdown alert table for the PR / ClickUp comments.
+        # Build a Markdown alert table for the PR comment (GitHub renders these).
         jq -r '
           [.site[]?.alerts[]?
             | {
@@ -294,6 +294,27 @@ jobs:
           echo "_No alerts reported._" > zap-summary.md
         fi
 
+        # Build a High-severity-only bullet list for the ClickUp comment.
+        # ClickUp does not render GFM tables but does render bullets, and Highs
+        # are the only items worth surfacing inline — the full detail lives in
+        # the linked HTML report.
+        jq -r '
+          [.site[]?.alerts[]?
+            | select(.riskcode == "3")
+            | {
+                name:  (.name // ""),
+                count: ((.instances // []) | length)
+              }
+          ]
+          | sort_by(.name)
+          | map("- \(.name) (\(.count) instance\(if .count == 1 then "" else "s" end))")
+          | .[]
+        ' report_json.json > zap-high-bullets.md
+
+        # Leave the file empty when there are no High findings — the ClickUp
+        # step uses [[ -s zap-high-bullets.md ]] to decide whether to include
+        # the block at all.
+
     - name: Upload ZAP reports to S3
       id: s3_upload
       if: steps.sec_check.outputs.enabled == 'true'
@@ -306,30 +327,73 @@ jobs:
         RUN_KEY:               ${{ steps.s3_urls.outputs.run_key }}
         BASE_URL:              ${{ steps.s3_urls.outputs.base_url }}
       run: |
+        set -euo pipefail
+
         AWS_DEFAULT_REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
         export AWS_DEFAULT_REGION
 
         S3_PREFIX="s3://${AWS_S3_BUCKET}/${PANTHEON_SITE}/${RUN_KEY}/security"
 
-        # Upload whichever report files the action produced.
-        for f in report_html.html report_md.md report_json.json zap-summary.md; do
-          if [[ -f "$f" ]]; then
-            case "$f" in
-              *.html) CT="text/html" ;;
-              *.json) CT="application/json" ;;
-              *.md)   CT="text/markdown" ;;
-              *)      CT="application/octet-stream" ;;
-            esac
-            aws s3 cp "$f" "${S3_PREFIX}/${f}" --content-type "$CT" --quiet
-          fi
+        # Quick local debug: log what's actually in the workspace so a future
+        # filename change in the ZAP action shows up plainly in the run log
+        # instead of as a silent "no files uploaded" mystery.
+        echo "Workspace report-ish files:"
+        ls -la report*.* zap-*.md 2>/dev/null || echo "  (no matching files found)"
+        echo ""
+
+        # Build the upload candidate list from any report_*.{html,md,json} the
+        # ZAP action produced, plus the summaries we generated ourselves. Using
+        # globs (not a hardcoded list) so an upstream filename change is caught.
+        shopt -s nullglob
+        CANDIDATES=( report_*.html report_*.md report_*.json zap-summary.md zap-high-bullets.md )
+        shopt -u nullglob
+
+        UPLOADED=()
+        UPLOADED_HTML=""
+        UPLOADED_JSON=""
+        UPLOADED_MD=""
+
+        for f in "${CANDIDATES[@]}"; do
+          [[ -f "$f" ]] || continue
+          case "$f" in
+            *.html) CT="text/html" ;;
+            *.json) CT="application/json" ;;
+            *.md)   CT="text/markdown" ;;
+            *)      CT="application/octet-stream" ;;
+          esac
+          aws s3 cp "$f" "${S3_PREFIX}/${f}" --content-type "$CT" --quiet
+          echo "  uploaded: ${f}"
+          UPLOADED+=("$f")
+
+          # Track the canonical report files by extension for the URL outputs.
+          case "$f" in
+            report_*.html) UPLOADED_HTML="$f" ;;
+            report_*.json) UPLOADED_JSON="$f" ;;
+            report_*.md)   UPLOADED_MD="$f"   ;;
+          esac
         done
 
-        echo "report_html_url=${BASE_URL}/report_html.html" >> "$GITHUB_OUTPUT"
-        echo "report_json_url=${BASE_URL}/report_json.json" >> "$GITHUB_OUTPUT"
-        echo "report_md_url=${BASE_URL}/report_md.md"       >> "$GITHUB_OUTPUT"
+        if [[ ${#UPLOADED[@]} -eq 0 ]]; then
+          echo "::error::No ZAP report files were uploaded — the action may have changed its output names or produced nothing. Check the 'Run OWASP ZAP baseline scan' step output."
+          exit 1
+        fi
 
-        echo "HTML report: ${BASE_URL}/report_html.html"
-        echo "JSON report: ${BASE_URL}/report_json.json"
+        echo "Uploaded ${#UPLOADED[@]} file(s) to ${S3_PREFIX}/"
+
+        # Only emit URL outputs for files that actually uploaded. Downstream
+        # steps check `!= ''` and skip cleanly when a report variant is absent.
+        if [[ -n "$UPLOADED_HTML" ]]; then
+          echo "report_html_url=${BASE_URL}/${UPLOADED_HTML}" >> "$GITHUB_OUTPUT"
+          echo "HTML report: ${BASE_URL}/${UPLOADED_HTML}"
+        fi
+        if [[ -n "$UPLOADED_JSON" ]]; then
+          echo "report_json_url=${BASE_URL}/${UPLOADED_JSON}" >> "$GITHUB_OUTPUT"
+          echo "JSON report: ${BASE_URL}/${UPLOADED_JSON}"
+        fi
+        if [[ -n "$UPLOADED_MD" ]]; then
+          echo "report_md_url=${BASE_URL}/${UPLOADED_MD}" >> "$GITHUB_OUTPUT"
+          echo "Markdown report: ${BASE_URL}/${UPLOADED_MD}"
+        fi
 
     # -------------------------------------------------------------------------
     # Post the summary to the PR (matches VRT comment style).
@@ -436,22 +500,32 @@ jobs:
           ICON="ℹ️"; HEADER="OWASP ZAP Baseline Scan — ${TOTAL} finding(s) (informational)"
         fi
 
-        # Build the comment body. Using a brace group of echo statements
-        # rather than a heredoc — heredoc body lines would need to sit at
-        # column 0, which breaks the YAML block scalar indentation.
+        # Build the comment body. ClickUp does not render GFM tables, so the
+        # full alert table is intentionally skipped here — the HTML report has
+        # all of that. Only High-severity items are surfaced inline (as
+        # bullets, which ClickUp does render), and only when there are any.
+        #
+        # Using a brace group of echo statements rather than a heredoc —
+        # heredoc body lines would need to sit at column 0, which breaks the
+        # YAML block scalar indentation.
         {
           echo "${ICON} ${HEADER}"
           echo ""
           echo "High: ${HIGH}  ·  Medium: ${MEDIUM}  ·  Low: ${LOW}  ·  Info: ${INFO}"
           echo ""
-          if [[ -f zap-summary.md ]]; then
-            cat zap-summary.md
+          if [[ -s zap-high-bullets.md ]]; then
+            echo "High-severity findings:"
+            cat zap-high-bullets.md
             echo ""
           fi
           echo "Environment : ${TARGET_ENV}"
           echo "Target URL  : ${TARGET_URL}"
-          echo "HTML report : ${REPORT_HTML_URL}"
-          echo "JSON report : ${REPORT_JSON_URL}"
+          if [[ -n "${REPORT_HTML_URL}" ]]; then
+            echo "HTML report : ${REPORT_HTML_URL}"
+          fi
+          if [[ -n "${REPORT_JSON_URL}" ]]; then
+            echo "JSON report : ${REPORT_JSON_URL}"
+          fi
           echo ""
           echo "---"
           echo "Security scan interpretation note:"
