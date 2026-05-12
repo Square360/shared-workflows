@@ -216,6 +216,45 @@ jobs:
         echo "S3 base URL: ${BASE_URL}"
 
     # -------------------------------------------------------------------------
+    # Wait for the target multidev to actually be serving traffic before we
+    # point ZAP at it. Even when this job has `needs: [deploy_multidev]` in
+    # the consumer template, Pantheon can briefly return 5xx from its load
+    # balancer between "deploy step finished" and "container is serving".
+    # Without this check, ZAP would happily scan a dead URL, produce an empty
+    # site report, and we'd post a misleading "✅ No findings" comment.
+    #
+    # 2xx/3xx/4xx are all proof-of-life (the app is responding, even with a
+    # redirect or auth challenge). 5xx is treated as "still provisioning" and
+    # retried. 60-second total budget (12 attempts × 5s sleep).
+    # -------------------------------------------------------------------------
+    - name: Wait for target to be reachable
+      id: reachability
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        TARGET_URL: ${{ steps.get_url.outputs.target_url }}
+      run: |
+        set -euo pipefail
+        MAX_ATTEMPTS=12
+        SLEEP_SECS=5
+        STATUS="000"
+
+        echo "Probing ${TARGET_URL} for reachability (up to $((MAX_ATTEMPTS * SLEEP_SECS))s)..."
+        for i in $(seq 1 "$MAX_ATTEMPTS"); do
+          STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 10 "$TARGET_URL" 2>/dev/null || echo "000")
+          if [[ "$STATUS" =~ ^[234][0-9][0-9]$ ]]; then
+            echo "✓ Target is responding (HTTP ${STATUS}) after attempt ${i}/${MAX_ATTEMPTS}"
+            echo "final_status=${STATUS}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "  attempt ${i}/${MAX_ATTEMPTS}: HTTP ${STATUS:-unknown} — sleeping ${SLEEP_SECS}s..."
+          sleep "$SLEEP_SECS"
+        done
+
+        echo "::error::Target ${TARGET_URL} did not return a reachable HTTP status (2xx/3xx/4xx) within $((MAX_ATTEMPTS * SLEEP_SECS))s. Last status: ${STATUS}. The multidev may have failed to provision or the deploy left it in a bad state."
+        echo "final_status=${STATUS}" >> "$GITHUB_OUTPUT"
+        exit 1
+
+    # -------------------------------------------------------------------------
     # Run the OWASP ZAP baseline scan.
     #
     # Action: zaproxy/action-baseline@v0.14.0 — actively maintained by the OWASP
@@ -253,6 +292,7 @@ jobs:
         # The action writes report_json.json to the workspace root.
         if [[ ! -f report_json.json ]]; then
           echo "report_json.json not found — ZAP action did not produce output"
+          echo "scan_status=missing_report" >> "$GITHUB_OUTPUT"
           echo "high=0"   >> "$GITHUB_OUTPUT"
           echo "medium=0" >> "$GITHUB_OUTPUT"
           echo "low=0"    >> "$GITHUB_OUTPUT"
@@ -260,6 +300,22 @@ jobs:
           echo "total=0"  >> "$GITHUB_OUTPUT"
           exit 0
         fi
+
+        # Detect scans that produced an empty .site[] array. The reachability
+        # check earlier in this workflow should have caught a dead target, but
+        # if the URL becomes unreachable mid-scan ZAP will still emit a JSON
+        # report with no sites. Surface that as "inconclusive" rather than
+        # silently reporting "no findings" — false negatives are worse than
+        # honest failures.
+        SITE_COUNT=$(jq '.site | length' report_json.json)
+        if [[ "$SITE_COUNT" -eq 0 ]]; then
+          echo "::warning::ZAP produced an empty site list — target was likely unreachable during the scan. Treating result as inconclusive."
+          SCAN_STATUS="inconclusive"
+        else
+          SCAN_STATUS="ok"
+        fi
+        echo "scan_status=${SCAN_STATUS}"   >> "$GITHUB_OUTPUT"
+        echo "site_count=${SITE_COUNT}"     >> "$GITHUB_OUTPUT"
 
         # ZAP riskcode: 3=High, 2=Medium, 1=Low, 0=Informational
         HIGH=$(jq   '[.site[]?.alerts[]? | select(.riskcode == "3")] | length' report_json.json)
@@ -274,7 +330,7 @@ jobs:
         echo "info=${INFO}"     >> "$GITHUB_OUTPUT"
         echo "total=${TOTAL}"   >> "$GITHUB_OUTPUT"
 
-        echo "ZAP findings — High: $HIGH, Medium: $MEDIUM, Low: $LOW, Info: $INFO"
+        echo "ZAP findings — Status: $SCAN_STATUS, Sites: $SITE_COUNT, High: $HIGH, Medium: $MEDIUM, Low: $LOW, Info: $INFO"
 
         # Build a Markdown alert table for the PR comment (GitHub renders these).
         jq -r '
@@ -412,6 +468,7 @@ jobs:
         INFO:            ${{ steps.summarise.outputs.info }}
         TOTAL:           ${{ steps.summarise.outputs.total }}
         SEVERITY_MODE:   ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:     ${{ steps.summarise.outputs.scan_status }}
       with:
         script: |
           const fs    = require('fs');
@@ -425,9 +482,14 @@ jobs:
           const info   = parseInt(process.env.INFO   || '0', 10);
           const total  = parseInt(process.env.TOTAL  || '0', 10);
           const mode   = process.env.SEVERITY_MODE || 'lenient';
+          const status = process.env.SCAN_STATUS || 'ok';
 
           let icon, statusText;
-          if (total === 0) {
+          if (status === 'inconclusive') {
+            icon = '⚠️'; statusText = 'Scan inconclusive — target was not reachable during the scan';
+          } else if (status === 'missing_report') {
+            icon = '⚠️'; statusText = 'Scan inconclusive — ZAP produced no report';
+          } else if (total === 0) {
             icon = '✅'; statusText = 'No findings';
           } else if (high > 0 && mode === 'strict') {
             icon = '❌'; statusText = `${high} High severity finding(s) — release candidate gate failed`;
@@ -484,13 +546,18 @@ jobs:
         INFO:              ${{ steps.summarise.outputs.info }}
         TOTAL:             ${{ steps.summarise.outputs.total }}
         SEVERITY_MODE:     ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:       ${{ steps.summarise.outputs.scan_status }}
       run: |
         if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
           echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set — skipping ClickUp comment"
           exit 0
         fi
 
-        if [[ "$TOTAL" == "0" ]]; then
+        if [[ "$SCAN_STATUS" == "inconclusive" ]]; then
+          ICON="⚠️"; HEADER="OWASP ZAP Baseline Scan — Inconclusive (target unreachable during scan)"
+        elif [[ "$SCAN_STATUS" == "missing_report" ]]; then
+          ICON="⚠️"; HEADER="OWASP ZAP Baseline Scan — Inconclusive (ZAP produced no report)"
+        elif [[ "$TOTAL" == "0" ]]; then
           ICON="✅"; HEADER="OWASP ZAP Baseline Scan — No findings"
         elif [[ "$HIGH" != "0" && "$SEVERITY_MODE" == "strict" ]]; then
           ICON="❌"; HEADER="OWASP ZAP Baseline Scan — ${HIGH} High finding(s) — RC gate failed"
@@ -582,13 +649,22 @@ jobs:
         INFO:             ${{ steps.summarise.outputs.info }}
         TOTAL:            ${{ steps.summarise.outputs.total }}
         SEVERITY_MODE:    ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:      ${{ steps.summarise.outputs.scan_status }}
       run: |
         if [[ -z "$SLACK_BOT_TOKEN" ]]; then
           echo "SLACK_BOT_TOKEN not set — skipping Slack notification"
           exit 0
         fi
 
-        if [[ "$TOTAL" == "0" ]]; then
+        if [[ "$SCAN_STATUS" == "inconclusive" ]]; then
+          STATUS_EMOJI=":warning:"
+          STATUS_COLOR="warning"
+          STATUS_TEXT="Inconclusive — target unreachable during scan"
+        elif [[ "$SCAN_STATUS" == "missing_report" ]]; then
+          STATUS_EMOJI=":warning:"
+          STATUS_COLOR="warning"
+          STATUS_TEXT="Inconclusive — ZAP produced no report"
+        elif [[ "$TOTAL" == "0" ]]; then
           STATUS_EMOJI=":white_check_mark:"
           STATUS_COLOR="good"
           STATUS_TEXT="No findings"
