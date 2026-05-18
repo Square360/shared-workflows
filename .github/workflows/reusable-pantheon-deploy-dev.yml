@@ -1,0 +1,283 @@
+name: Reusable Deploy to Pantheon DEV
+
+# -----------------------------------------------------------------------------
+# Deploys master/main to Pantheon DEV after a successful semantic-release run.
+#
+# This is the simple-track / single-environment deploy. The multidev variants
+# (pr / rc / epic) live in separate workflow files in this directory.
+# target_env is hardcoded to 'dev' — there is no parameterization. The
+# DEV → TEST → LIVE promotion path is handled manually through the Pantheon
+# dashboard (per the Square360 SOP).
+#
+# Composite actions used:
+#   ./.github/actions/terminus-install
+#   ./.github/actions/pantheon-push
+#   ./.github/actions/pantheon-post-deploy-drush
+#
+# PR-title flag support is delegated to pantheon-post-deploy-drush:
+#   [config-first]  — run drush cim before updb
+#   [verbose]       — pass -v to drush updb
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      backup_hours_threshold:
+        description: 'Hours threshold for live backup check (default: 6)'
+        required: false
+        type: number
+        default: 6
+      run_semantic_release:
+        description: 'Whether to run semantic-release before deploying'
+        required: false
+        type: boolean
+        default: true
+      slack_channel:
+        description: 'Slack channel for notifications (e.g. #deployments)'
+        required: false
+        type: string
+      workflow_skip_terminus:
+        description: 'Skip post-deploy Terminus commands (updb, cim, cache rebuild)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PANTHEON_SSH_KEY:
+        required: true
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      CI_GH_TOKEN:
+        required: false
+      SLACK_BOT_TOKEN:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  semantic_release:
+    name: Semantic Release
+    if: ${{ inputs.run_semantic_release }}
+    uses: ./.github/workflows/reusable-semantic-release.yml
+    secrets:
+      CI_GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
+
+  deploy_to_pantheon_dev:
+    name: Deploy to Pantheon DEV
+    needs: semantic_release
+    # Run even when semantic_release is skipped (run_semantic_release=false).
+    if: ${{ always() && (needs.semantic_release.result == 'success' || needs.semantic_release.result == 'skipped') }}
+    permissions:
+      deployments: write
+      contents: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      env_url: ${{ steps.env_url.outputs.url }}
+      error_message: ${{ steps.capture_error.outputs.error_message }}
+      failed_step: ${{ steps.capture_error.outputs.failed_step }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Always check out the target branch (master/main) for deployment.
+          # github.ref is correct on push triggers; pull_request.base.ref is
+          # the safety net if this workflow is wired up via PR events.
+          ref: ${{ github.event.pull_request.base.ref || github.ref }}
+          # Shallow clone — pantheon-systems/push-to-pantheon handles unshallowing.
+          fetch-depth: 1
+
+      - name: Install Terminus
+        uses: ./.github/actions/terminus-install
+        with:
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Push code to Pantheon DEV. target_env is hardcoded; source_env is
+      # intentionally omitted (no multidev clone for a real env deploy).
+      # -----------------------------------------------------------------------
+      - name: Push code to Pantheon DEV
+        id: deploy_pantheon
+        uses: ./.github/actions/pantheon-push
+        with:
+          site: ${{ inputs.pantheon_site }}
+          target_env: dev
+          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Backup-on-live safety net: if the last live backup is older than the
+      # configured threshold, take a fresh one before we run drush against
+      # dev. This protects the operator's ability to roll back if a dev
+      # change later gets promoted to test/live and turns out badly.
+      #
+      # All errors here are swallowed deliberately — a brand-new site has no
+      # live env and no backup history, and we don't want that to block dev
+      # deploys.
+      # -----------------------------------------------------------------------
+      - name: Check last live backup age
+        id: last_backup
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          THRESHOLD_HOURS: ${{ inputs.backup_hours_threshold }}
+        run: |
+          if last_timestamp=$(terminus backup:info --element database --format list --field date "${SITE}.live" 2>&1); then
+            echo "Retrieved backup info from live environment"
+
+            last_epoch="${last_timestamp%%.*}"
+            current_epoch=$(date +%s)
+            time_diff=$((current_epoch - last_epoch))
+            hours_calc=$((THRESHOLD_HOURS * 3600))
+
+            if [[ $time_diff -gt $hours_calc ]]; then
+              echo "Last backup was $((time_diff / 3600))h ago — new backup needed"
+              echo "needs_backup=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Last backup was $((time_diff / 3600))h ago — within threshold"
+              echo "needs_backup=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Could not retrieve backup info from live (env may not exist yet). Skipping backup creation."
+            echo "needs_backup=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create backup on live
+        id: create_backup
+        if: ${{ steps.last_backup.outputs.needs_backup == 'true' }}
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+        run: |
+          echo "Creating backup on live (keep-for 30 days)"
+          terminus -n env:clear-cache "${SITE}.live"
+          terminus -n backup:create "${SITE}.live" --keep-for=30 --no-interaction --quiet --yes
+
+      - name: Run post-deploy drush commands
+        id: drush_commands
+        uses: ./.github/actions/pantheon-post-deploy-drush
+        with:
+          site: ${{ inputs.pantheon_site }}
+          env: dev
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          skip: ${{ inputs.workflow_skip_terminus }}
+          pr_title: ${{ github.event.pull_request.title }}
+
+      - name: Get environment URL
+        id: env_url
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+        run: |
+          URL=$(terminus env:view "${SITE}.dev" --print)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Environment available at: $URL"
+
+      - name: Capture error information
+        id: capture_error
+        if: ${{ failure() }}
+        run: |
+          if [[ "${{ steps.deploy_pantheon.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Pantheon Deployment" >> "$GITHUB_OUTPUT"
+            echo "error_message=Failed to deploy to Pantheon DEV. Check the deployment logs." >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.last_backup.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Backup Check" >> "$GITHUB_OUTPUT"
+            echo "error_message=Failed to check live backup status." >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.create_backup.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Backup Creation" >> "$GITHUB_OUTPUT"
+            echo "error_message=Failed to create backup on live." >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.drush_commands.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Drush Commands" >> "$GITHUB_OUTPUT"
+            echo "error_message=Failed to run drush updb/cim/cr on dev." >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.env_url.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Environment URL" >> "$GITHUB_OUTPUT"
+            echo "error_message=Failed to retrieve environment URL from Pantheon." >> "$GITHUB_OUTPUT"
+          else
+            echo "failed_step=Unknown" >> "$GITHUB_OUTPUT"
+            echo "error_message=Dev deployment failed at an unknown step. Check the workflow logs." >> "$GITHUB_OUTPUT"
+          fi
+
+  notify_slack:
+    name: Notify Slack
+    needs: [semantic_release, deploy_to_pantheon_dev]
+    if: ${{ always() && inputs.slack_channel }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          SEMANTIC_RESULT: ${{ needs.semantic_release.result }}
+          DEPLOY_RESULT: ${{ needs.deploy_to_pantheon_dev.result }}
+          ENV_URL: ${{ needs.deploy_to_pantheon_dev.outputs.env_url }}
+          FAILED_STEP: ${{ needs.deploy_to_pantheon_dev.outputs.failed_step }}
+          ERROR_MESSAGE: ${{ needs.deploy_to_pantheon_dev.outputs.error_message }}
+          REPO: ${{ github.repository }}
+          SITE: ${{ inputs.pantheon_site }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
+            exit 0
+          fi
+
+          # Decide overall status. Semantic-release failure takes precedence
+          # because deploy is gated on semantic_release succeeding or being
+          # skipped — a failure there means the deploy never ran.
+          if [[ "$SEMANTIC_RESULT" == "failure" ]]; then
+            STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed";    PHASE="Semantic Release"
+          elif [[ "$DEPLOY_RESULT" == "success" ]]; then
+            STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success";   PHASE="Deployment"
+          elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
+            STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed";    PHASE="Deployment"
+          elif [[ "$DEPLOY_RESULT" == "cancelled" ]]; then
+            STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled"; PHASE="Deployment"
+          elif [[ "$SEMANTIC_RESULT" == "cancelled" ]]; then
+            STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled"; PHASE="Semantic Release"
+          else
+            STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown";   PHASE="Unknown"
+          fi
+
+          ENV_URL_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "success" && -n "$ENV_URL" ]]; then
+            ENV_URL_FIELD=",{\"title\": \"Environment URL\", \"value\": \"<${ENV_URL}|${ENV_URL}>\", \"short\": false}"
+          fi
+
+          ERROR_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
+            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
+            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
+            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          elif [[ "$SEMANTIC_RESULT" == "failure" ]]; then
+            ERROR_FIELD=",{\"title\": \"Error Details\", \"value\": \"Semantic release failed. Deployment was not attempted. Check the workflow logs.\", \"short\": false}"
+          fi
+
+          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data "{
+              \"channel\": \"${SLACK_CHANNEL}\",
+              \"text\": \"${STATUS_EMOJI} DEV Deployment ${STATUS_TEXT}\",
+              \"attachments\": [
+                {
+                  \"color\": \"${STATUS_COLOR}\",
+                  \"fields\": [
+                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
+                    {\"title\": \"Environment\", \"value\": \"dev\", \"short\": true},
+                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
+                    {\"title\": \"Phase\", \"value\": \"${PHASE}\", \"short\": true},
+                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
+                    ${ENV_URL_FIELD}
+                    ${ERROR_FIELD}
+                  ],
+                  \"footer\": \"GitHub Actions\",
+                  \"ts\": $(date +%s)
+                }
+              ]
+            }" \
+            https://slack.com/api/chat.postMessage

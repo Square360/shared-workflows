@@ -1,0 +1,233 @@
+name: Reusable Deploy to RC Multidev (Pantheon)
+
+# -----------------------------------------------------------------------------
+# Deploys the develop branch to a Pantheon multidev named rc-<YYYY>-<WW> (ISO
+# year and week). Triggered on the consumer side by pushes/merges to develop.
+# Multiple merges in the same ISO week share the same multidev.
+#
+# Defaults:
+#   - source_env: live if it exists, otherwise dev (so the RC reflects what's
+#                 currently in production, not what's in dev)
+#   - ClickUp comment: skipped (rc-multidev triggers are push events, no PR
+#                      context to extract a task ID from)
+#   - Security scan: MANDATORY (force_run=true). The release-candidate gate.
+#   - VRT: not bundled. VRT remains a PR-time opt-in.
+#
+# No skip-multidev / docs-only gating here — those are PR-body flags. A push
+# to develop is the post-merge state; the developer can't opt out at this point.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications (e.g. #deployments)'
+        required: false
+        type: string
+      workflow_skip_terminus:
+        description: 'Skip post-deployment Terminus commands (updb, cim, cache rebuild)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PANTHEON_SSH_KEY:
+        required: true
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_S3_BUCKET:
+        required: false
+      AWS_S3_REGION:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy_rc_multidev:
+    name: Deploy to RC Multidev
+    permissions:
+      deployments: write
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.derive.outputs.target_env }}
+      multidev_url: ${{ steps.multidev_url.outputs.url }}
+      error_message: ${{ steps.capture_error.outputs.error_message }}
+      failed_step: ${{ steps.capture_error.outputs.failed_step }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Derive multidev name from ISO week
+        id: derive
+        run: |
+          # ISO 8601 year-week. %G gives ISO year (may differ from calendar year
+          # near Jan/Dec boundaries); %V gives ISO week number with zero-pad.
+          TARGET_ENV="rc-$(date -u +'%G-%V')"
+          echo "target_env=${TARGET_ENV}" >> $GITHUB_OUTPUT
+          echo "Derived RC multidev name: ${TARGET_ENV}"
+
+      - name: Install Terminus
+        uses: ./.github/actions/terminus-install
+        with:
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+
+      - name: Determine source environment
+        id: source_env
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+        run: |
+          # RC multidevs prefer live as the source (so the RC starts from the
+          # current production state and the merged changes apply on top). Fall
+          # back to dev if live doesn't exist yet (e.g. a new site pre-launch).
+          if terminus env:list "${SITE}" --format=list | grep -q "^live$"; then
+            echo "source_env=live" >> $GITHUB_OUTPUT
+            echo "Using 'live' as source environment"
+          else
+            echo "source_env=dev" >> $GITHUB_OUTPUT
+            echo "'live' environment not found, falling back to 'dev'"
+          fi
+
+      - name: Push code to Pantheon multidev
+        id: deploy
+        uses: ./.github/actions/pantheon-push
+        with:
+          site: ${{ inputs.pantheon_site }}
+          target_env: ${{ steps.derive.outputs.target_env }}
+          source_env: ${{ steps.source_env.outputs.source_env }}
+          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          commit_message: 'Automated deployment from GitHub Actions to RC multidev ${{ steps.derive.outputs.target_env }}'
+
+      - name: Run post-deploy drush commands
+        id: drush_commands
+        uses: ./.github/actions/pantheon-post-deploy-drush
+        with:
+          site: ${{ inputs.pantheon_site }}
+          env: ${{ steps.derive.outputs.target_env }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          skip: ${{ inputs.workflow_skip_terminus }}
+          # No pr_title for push events; [config-first] / [verbose] flags don't apply here.
+          pr_title: ''
+
+      - name: Get multidev URL
+        id: multidev_url
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+        run: |
+          URL=$(terminus env:view "${SITE}.${TARGET_ENV}" --print)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "RC multidev available at: $URL"
+
+      - name: Capture error information
+        id: capture_error
+        if: ${{ failure() }}
+        run: |
+          if [[ "${{ steps.deploy.conclusion }}" == "failure" ]]; then
+            echo "failed_step=RC Multidev Deployment" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to deploy to RC multidev. Check deployment logs." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.drush_commands.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Drush Commands" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to run drush updb/cim/cr on RC multidev." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.multidev_url.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Multidev URL" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to retrieve RC multidev URL from Pantheon." >> $GITHUB_OUTPUT
+          else
+            echo "failed_step=Unknown" >> $GITHUB_OUTPUT
+            echo "error_message=RC multidev deployment failed at an unknown step." >> $GITHUB_OUTPUT
+          fi
+
+  security_scan:
+    name: Security Scan (mandatory on rc-*)
+    needs: deploy_rc_multidev
+    # The security workflow detects rc-* internally and runs unconditionally
+    # in strict mode (fails on any High-severity finding). No force_run needed.
+    uses: ./.github/workflows/reusable-pantheon-security-scan.yml
+    with:
+      pantheon_site: ${{ inputs.pantheon_site }}
+      target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
+      slack_channel: ${{ inputs.slack_channel }}
+    secrets: inherit
+
+  notify_slack:
+    name: Notify Slack
+    needs: deploy_rc_multidev
+    if: ${{ always() && inputs.slack_channel }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          DEPLOY_RESULT: ${{ needs.deploy_rc_multidev.result }}
+          MULTIDEV_URL: ${{ needs.deploy_rc_multidev.outputs.multidev_url }}
+          TARGET_ENV: ${{ needs.deploy_rc_multidev.outputs.target_env }}
+          FAILED_STEP: ${{ needs.deploy_rc_multidev.outputs.failed_step }}
+          ERROR_MESSAGE: ${{ needs.deploy_rc_multidev.outputs.error_message }}
+          REPO: ${{ github.repository }}
+          SITE: ${{ inputs.pantheon_site }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
+            exit 0
+          fi
+
+          case "$DEPLOY_RESULT" in
+            success)   STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success"   ;;
+            failure)   STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed"    ;;
+            cancelled) STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled" ;;
+            *)         STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown"   ;;
+          esac
+
+          ENV_URL_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "success" && -n "$MULTIDEV_URL" ]]; then
+            ENV_URL_FIELD=",{\"title\": \"RC Multidev URL\", \"value\": \"<${MULTIDEV_URL}|${MULTIDEV_URL}>\", \"short\": false}"
+          fi
+
+          ERROR_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
+            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
+            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
+            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          fi
+
+          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data "{
+              \"channel\": \"${SLACK_CHANNEL}\",
+              \"text\": \"${STATUS_EMOJI} RC Multidev Deployment ${STATUS_TEXT}\",
+              \"attachments\": [
+                {
+                  \"color\": \"${STATUS_COLOR}\",
+                  \"fields\": [
+                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
+                    {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\", \"short\": true},
+                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
+                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
+                    ${ENV_URL_FIELD}
+                    ${ERROR_FIELD}
+                  ],
+                  \"footer\": \"GitHub Actions\",
+                  \"ts\": $(date +%s)
+                }
+              ]
+            }" \
+            https://slack.com/api/chat.postMessage

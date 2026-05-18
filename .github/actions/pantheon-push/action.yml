@@ -1,0 +1,75 @@
+name: 'Push code to a Pantheon environment'
+description: 'Sets up PHP, installs Composer dependencies, and pushes the current workspace to a Pantheon environment via pantheon-systems/push-to-pantheon. Assumes the repo is already checked out.'
+
+inputs:
+  site:
+    description: 'Pantheon site machine name'
+    required: true
+  target_env:
+    description: 'Target Pantheon environment (dev, test, live, or a multidev like pr-22 / rc-2026-21 / epr-757)'
+    required: true
+  source_env:
+    description: 'Source environment for multidev clone (e.g. dev or live). Leave empty for non-multidev deploys (i.e. when target_env is dev/test/live).'
+    required: false
+    default: ''
+  ssh_key:
+    description: 'SSH key for Pantheon git access. Pass from caller-side secrets.PANTHEON_SSH_KEY.'
+    required: true
+  machine_token:
+    description: 'Pantheon machine token. Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
+    required: true
+  commit_message:
+    description: 'Commit message used on the synthetic deploy commit.'
+    required: false
+    default: 'Automated deployment from GitHub Actions'
+  php_version:
+    description: 'PHP version for the build runner.'
+    required: false
+    default: '8.4'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php_version }}
+        tools: composer:v2
+
+    - name: Add Bitbucket to known hosts
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan bitbucket.org >> ~/.ssh/known_hosts
+
+    - name: Get Composer cache directory
+      id: composer-cache
+      shell: bash
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+    - name: Cache Composer dependencies
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+        restore-keys: ${{ runner.os }}-composer-
+
+    - name: Install Composer dependencies
+      shell: bash
+      run: composer install --no-dev --optimize-autoloader --no-interaction
+
+    - name: Push to Pantheon
+      uses: pantheon-systems/push-to-pantheon@0.9.0
+      env:
+        COMPOSER_NO_SECURITY_BLOCKING: 1
+      with:
+        ssh_key: ${{ inputs.ssh_key }}
+        machine_token: ${{ inputs.machine_token }}
+        site: ${{ inputs.site }}
+        target_env: ${{ inputs.target_env }}
+        source_env: ${{ inputs.source_env }}
+        git_user_name: ${{ github.event.pull_request.user.login || github.actor }}
+        git_user_email: ${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.actor) }}
+        git_commit_message: ${{ inputs.commit_message }}
+        delete_old_environments: false
+        clone_content: false

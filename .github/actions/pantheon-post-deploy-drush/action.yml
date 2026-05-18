@@ -1,0 +1,51 @@
+name: 'Pantheon post-deploy Drush commands'
+description: 'Runs database updates (updb), config import (cim), and cache rebuild via Terminus drush on a Pantheon environment. Honors [config-first] (run cim before updb) and [verbose] (verbose updb) PR-title flags. Requires Terminus to already be installed and authenticated.'
+
+inputs:
+  site:
+    description: 'Pantheon site machine name'
+    required: true
+  env:
+    description: 'Pantheon environment name (e.g. dev, pr-22, rc-2026-21, epr-757)'
+    required: true
+  machine_token:
+    description: 'Pantheon machine token (required for terminus drush). Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
+    required: true
+  skip:
+    description: 'If "true", skip running drush commands entirely. Pass the workflow_skip_terminus input through.'
+    required: false
+    default: 'false'
+  pr_title:
+    description: 'PR title (for [config-first] and [verbose] flag detection). Leave empty for non-PR triggers — flags will not match and default ordering applies.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run config imports and db updates
+      if: ${{ inputs.skip != 'true' }}
+      shell: bash
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ inputs.machine_token }}
+        PR_TITLE: ${{ inputs.pr_title }}
+        SITE: ${{ inputs.site }}
+        ENV: ${{ inputs.env }}
+      run: |
+        UPDB_FLAGS="-y"
+        if [[ "$PR_TITLE" == *"[verbose]"* ]]; then
+          echo "🔍 Verbose updb enabled (detected [verbose] tag)"
+          UPDB_FLAGS="-y -v"
+        fi
+
+        if [[ "$PR_TITLE" == *"[config-first]"* ]]; then
+          echo "🔧 Running config import first (detected [config-first] tag)"
+          terminus -n drush "${SITE}.${ENV}" -- cim -y
+          terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
+        else
+          echo "🔧 Running database update first (default order)"
+          terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
+          terminus -n drush "${SITE}.${ENV}" -- cim -y
+        fi
+
+        terminus -n env:clear-cache "${SITE}.${ENV}"

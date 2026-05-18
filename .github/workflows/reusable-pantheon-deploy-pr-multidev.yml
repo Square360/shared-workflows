@@ -1,0 +1,326 @@
+name: Reusable Deploy to PR Multidev (Pantheon)
+
+# -----------------------------------------------------------------------------
+# Deploys the PR's branch to a Pantheon multidev named pr-<NUMBER> (the GitHub
+# PR number). Triggered by PR open / push events on the consumer side.
+#
+# Defaults:
+#   - source_env: dev (PR multidevs are always cloned from dev)
+#   - ClickUp comment label: "WIP Multidev"
+#   - GitHub PR comment with the multidev URL
+#   - Security scan: opt-in via [run-security] (or legacy [security]) in PR body
+#   - VRT: opt-in via [run-vrt] (or legacy [vrt]) in PR body
+#
+# Opt-out flags in PR body:
+#   - [skip-multidev]: skip the multidev build entirely (static checks elsewhere still run)
+#   - [docs-only]:     skip multidev + security scan + VRT (no runtime test needed)
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications (e.g. #deployments)'
+        required: false
+        type: string
+      workflow_skip_terminus:
+        description: 'Skip post-deployment Terminus commands (updb, cim, cache rebuild)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PANTHEON_SSH_KEY:
+        required: true
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: false
+      CLICKUP_API_TOKEN:
+        required: false
+      CLICKUP_TEAM_ID:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_S3_BUCKET:
+        required: false
+      AWS_S3_REGION:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy_pr_multidev:
+    name: Deploy to PR Multidev
+    # Skip if the developer opted out via [skip-multidev] or [docs-only] in PR body.
+    if: ${{ !contains(github.event.pull_request.body, '[skip-multidev]') && !contains(github.event.pull_request.body, '[docs-only]') }}
+    permissions:
+      deployments: write
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.derive.outputs.target_env }}
+      multidev_url: ${{ steps.multidev_url.outputs.url }}
+      env_is_new: ${{ steps.check_env.outputs.env_is_new }}
+      error_message: ${{ steps.capture_error.outputs.error_message }}
+      failed_step: ${{ steps.capture_error.outputs.failed_step }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Derive multidev name from PR number
+        id: derive
+        run: echo "target_env=pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+
+      - name: Install Terminus
+        uses: ./.github/actions/terminus-install
+        with:
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+
+      - name: Check if multidev environment exists
+        id: check_env
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+        run: |
+          echo "Checking if ${SITE}.${TARGET_ENV} exists..."
+          if terminus env:info "${SITE}.${TARGET_ENV}" >/dev/null 2>&1; then
+            echo "env_is_new=false" >> $GITHUB_OUTPUT
+            echo "Multidev exists, ClickUp comment will say 'updated'"
+          else
+            echo "env_is_new=true" >> $GITHUB_OUTPUT
+            echo "Multidev is new, ClickUp comment will say 'created'"
+          fi
+
+      - name: Push code to Pantheon multidev
+        id: deploy
+        uses: ./.github/actions/pantheon-push
+        with:
+          site: ${{ inputs.pantheon_site }}
+          target_env: ${{ steps.derive.outputs.target_env }}
+          source_env: dev
+          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          commit_message: 'Automated deployment from GitHub Actions to multidev ${{ steps.derive.outputs.target_env }}'
+
+      - name: Run post-deploy drush commands
+        id: drush_commands
+        uses: ./.github/actions/pantheon-post-deploy-drush
+        with:
+          site: ${{ inputs.pantheon_site }}
+          env: ${{ steps.derive.outputs.target_env }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          skip: ${{ inputs.workflow_skip_terminus }}
+          pr_title: ${{ github.event.pull_request.title }}
+
+      - name: Get multidev URL
+        id: multidev_url
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+        run: |
+          URL=$(terminus env:view "${SITE}.${TARGET_ENV}" --print)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Multidev available at: $URL"
+
+      - name: Comment on ClickUp task with multidev URL
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+          MULTIDEV_URL: ${{ steps.multidev_url.outputs.url }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+          ENV_IS_NEW: ${{ steps.check_env.outputs.env_is_new }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.head_ref }}
+          SITE: ${{ inputs.pantheon_site }}
+        run: |
+          if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
+            echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set, skipping ClickUp comment"
+            exit 0
+          fi
+          TASK_ID=$(echo "$BRANCH $PR_TITLE" | grep -oP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+          if [[ -z "$TASK_ID" ]]; then
+            echo "No ClickUp task ID found in branch or PR title, skipping comment"
+            exit 0
+          fi
+          echo "Found ClickUp task ID: $TASK_ID"
+          ACTION=$([[ "$ENV_IS_NEW" == "true" ]] && echo "created" || echo "updated")
+          PR_LINE=""
+          if [[ -n "$PR_NUMBER" ]]; then
+            PR_LINE="\nPull Request: https://github.com/${REPO}/pull/${PR_NUMBER}"
+          fi
+          RESPONSE=$(curl -s -o /tmp/clickup_response.json -w "%{http_code}" -X POST \
+            "https://api.clickup.com/api/v2/task/${TASK_ID}/comment?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}" \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment_text\": \"The WIP Multidev environment was ${ACTION}: ${MULTIDEV_URL}\n\nEnvironment: ${TARGET_ENV}\nSite: ${SITE}${PR_LINE}\"}" || true)
+          echo "ClickUp API response code: $RESPONSE"
+          cat /tmp/clickup_response.json || true
+          if [[ "$RESPONSE" != "200" ]]; then
+            echo "Warning: ClickUp comment may not have been posted (HTTP $RESPONSE)"
+          fi
+
+      - name: Comment on PR with multidev URL
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const url = '${{ steps.multidev_url.outputs.url }}';
+            const targetEnv = '${{ steps.derive.outputs.target_env }}';
+            const site = '${{ inputs.pantheon_site }}';
+            const comment = `🚀 **Multidev Environment Ready!**
+
+            Your changes have been deployed to: <a href="${url}" target="_blank">${url}</a>
+
+            Environment: \`${targetEnv}\`
+            Site: \`${site}\``;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Capture error information
+        id: capture_error
+        if: ${{ failure() }}
+        run: |
+          if [[ "${{ steps.deploy.conclusion }}" == "failure" ]]; then
+            echo "failed_step=PR Multidev Deployment" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to deploy to PR multidev. Check deployment logs." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.drush_commands.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Drush Commands" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to run drush updb/cim/cr on PR multidev." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.multidev_url.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Multidev URL" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to retrieve multidev URL from Pantheon." >> $GITHUB_OUTPUT
+          else
+            echo "failed_step=Unknown" >> $GITHUB_OUTPUT
+            echo "error_message=PR multidev deployment failed at an unknown step." >> $GITHUB_OUTPUT
+          fi
+
+  security_scan:
+    name: Security Scan (opt-in)
+    needs: deploy_pr_multidev
+    # Opt-in via new [run-security] flag; legacy [security] still accepted during transition.
+    if: >-
+      ${{
+        contains(github.event.pull_request.body, '[run-security]') ||
+        contains(github.event.pull_request.body, '[security]')
+      }}
+    uses: ./.github/workflows/reusable-pantheon-security-scan.yml
+    with:
+      pantheon_site: ${{ inputs.pantheon_site }}
+      target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
+      slack_channel: ${{ inputs.slack_channel }}
+    secrets: inherit
+
+  visual_regression:
+    name: Visual Regression (opt-in)
+    needs: deploy_pr_multidev
+    # Opt-in via new [run-vrt] flag; legacy [vrt] still accepted during transition.
+    if: >-
+      ${{
+        contains(github.event.pull_request.body, '[run-vrt]') ||
+        contains(github.event.pull_request.body, '[vrt]')
+      }}
+    uses: ./.github/workflows/reusable-pantheon-vrt.yml
+    with:
+      pantheon_site: ${{ inputs.pantheon_site }}
+      target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
+      slack_channel: ${{ inputs.slack_channel }}
+    secrets: inherit
+
+  notify_slack:
+    name: Notify Slack
+    needs: deploy_pr_multidev
+    if: ${{ always() && inputs.slack_channel }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          DEPLOY_RESULT: ${{ needs.deploy_pr_multidev.result }}
+          MULTIDEV_URL: ${{ needs.deploy_pr_multidev.outputs.multidev_url }}
+          TARGET_ENV: ${{ needs.deploy_pr_multidev.outputs.target_env }}
+          FAILED_STEP: ${{ needs.deploy_pr_multidev.outputs.failed_step }}
+          ERROR_MESSAGE: ${{ needs.deploy_pr_multidev.outputs.error_message }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SITE: ${{ inputs.pantheon_site }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
+            exit 0
+          fi
+
+          # Status decoding
+          case "$DEPLOY_RESULT" in
+            success)   STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success"   ;;
+            failure)   STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed"    ;;
+            cancelled) STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled" ;;
+            skipped)   STATUS_EMOJI=":fast_forward:";     STATUS_COLOR="#808080"; STATUS_TEXT="Skipped"   ;;
+            *)         STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown"   ;;
+          esac
+
+          ENV_URL_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "success" && -n "$MULTIDEV_URL" ]]; then
+            ENV_URL_FIELD=",{\"title\": \"Multidev URL\", \"value\": \"<${MULTIDEV_URL}|${MULTIDEV_URL}>\", \"short\": false}"
+          fi
+
+          PR_FIELD=""
+          if [[ -n "$PR_NUMBER" ]]; then
+            PR_TITLE_ESCAPED=$(printf '%s' "$PR_TITLE" | jq -Rs .)
+            PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": false},{\"title\": \"PR Title\", \"value\": ${PR_TITLE_ESCAPED}, \"short\": false}"
+          fi
+
+          ERROR_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
+            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
+            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
+            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          fi
+
+          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data "{
+              \"channel\": \"${SLACK_CHANNEL}\",
+              \"text\": \"${STATUS_EMOJI} PR Multidev Deployment ${STATUS_TEXT}\",
+              \"attachments\": [
+                {
+                  \"color\": \"${STATUS_COLOR}\",
+                  \"fields\": [
+                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
+                    {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\", \"short\": true},
+                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
+                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
+                    ${ENV_URL_FIELD}
+                    ${PR_FIELD}
+                    ${ERROR_FIELD}
+                  ],
+                  \"footer\": \"GitHub Actions\",
+                  \"ts\": $(date +%s)
+                }
+              ]
+            }" \
+            https://slack.com/api/chat.postMessage
