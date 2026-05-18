@@ -125,7 +125,7 @@ jobs:
           echo "Epic multidev: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.0.2
         with:
           machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
 
@@ -147,7 +147,7 @@ jobs:
 
       - name: Push code to Pantheon epic multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.0.2
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -158,7 +158,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.0.2
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -233,7 +233,7 @@ jobs:
     # The security workflow detects epr-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding) — same gate as rc-*,
     # per the Square360 SOP for epic integration multidevs. No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.0.2
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_epic_multidev.outputs.target_env }}

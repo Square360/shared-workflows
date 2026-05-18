@@ -1,10 +1,14 @@
 name: 'Install Terminus and authenticate'
-description: 'Downloads the latest Terminus CLI to /usr/local/bin and logs in with the provided machine token.'
+description: 'Downloads a pinned Terminus CLI release to /usr/local/bin and logs in with the provided machine token.'
 
 inputs:
   machine_token:
     description: 'Pantheon machine token. Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
     required: true
+  terminus_version:
+    description: 'Terminus release tag to install (e.g. 4.2.2). The default keeps consumers on a known-good version and avoids the GitHub API rate-limit failures the earlier "discover latest" curl was prone to.'
+    required: false
+    default: '4.2.2'
 
 runs:
   using: 'composite'
@@ -13,8 +17,9 @@ runs:
       shell: bash
       env:
         TERMINUS_MACHINE_TOKEN: ${{ inputs.machine_token }}
+        TERMINUS_VERSION: ${{ inputs.terminus_version }}
       run: |
-        TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+        echo "Installing Terminus ${TERMINUS_VERSION}"
         curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" -o /usr/local/bin/terminus
         chmod +x /usr/local/bin/terminus
         terminus --version
