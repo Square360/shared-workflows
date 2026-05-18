@@ -70,6 +70,7 @@ jobs:
     permissions:
       deployments: write
       contents: write
+      pull-requests: read
     runs-on: ubuntu-latest
     outputs:
       target_env: ${{ steps.derive.outputs.target_env }}
