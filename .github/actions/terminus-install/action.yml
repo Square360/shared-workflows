@@ -1,0 +1,21 @@
+name: 'Install Terminus and authenticate'
+description: 'Downloads the latest Terminus CLI to /usr/local/bin and logs in with the provided machine token.'
+
+inputs:
+  machine_token:
+    description: 'Pantheon machine token. Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install and authenticate Terminus
+      shell: bash
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ inputs.machine_token }}
+      run: |
+        TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+        curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" -o /usr/local/bin/terminus
+        chmod +x /usr/local/bin/terminus
+        terminus --version
+        terminus auth:login --machine-token="$TERMINUS_MACHINE_TOKEN"

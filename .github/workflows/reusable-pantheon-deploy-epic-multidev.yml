@@ -1,0 +1,316 @@
+name: Reusable Deploy to Epic Multidev (Pantheon)
+
+# -----------------------------------------------------------------------------
+# Deploys an epic branch to a Pantheon multidev named epr-<NNN> (where NNN is
+# the epic's ClickUp ticket number, extracted from the branch name). Triggered
+# on the consumer side by pushes to epic/* branches and by sub-ticket PR merges
+# into the epic branch.
+#
+# Epic branch naming: epic/<TICKET-ID>[-<short-description>]
+#   e.g. epic/PROJ-757 or epic/PROJ-757-event-listing-system
+# The NNN is extracted by parsing the numeric portion of the TICKET-ID.
+#
+# Defaults:
+#   - source_env: dev
+#   - ClickUp comment: posted to the epic ticket on each redeploy
+#   - Security scan: MANDATORY on every redeploy — per the Square360 SOP for
+#                    epic integration multidevs. The security workflow detects
+#                    epr-* internally and runs in strict mode; no force_run flag
+#                    is needed on the caller.
+#   - VRT: not bundled. VRT remains a PR-time opt-in.
+#
+# No skip-multidev / docs-only gating here — those are PR-body flags. A push
+# to an epic branch is the post-merge state; the developer can't opt out at
+# this point.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications (e.g. #deployments)'
+        required: false
+        type: string
+      workflow_skip_terminus:
+        description: 'Skip post-deployment Terminus commands (updb, cim, cache rebuild)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      PANTHEON_SSH_KEY:
+        required: true
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: false
+      CLICKUP_API_TOKEN:
+        required: false
+      CLICKUP_TEAM_ID:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_S3_BUCKET:
+        required: false
+      AWS_S3_REGION:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy_epic_multidev:
+    name: Deploy to Epic Multidev
+    permissions:
+      deployments: write
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.derive.outputs.target_env }}
+      epic_ticket_id: ${{ steps.derive.outputs.epic_ticket_id }}
+      multidev_url: ${{ steps.multidev_url.outputs.url }}
+      env_is_new: ${{ steps.check_env.outputs.env_is_new }}
+      error_message: ${{ steps.capture_error.outputs.error_message }}
+      failed_step: ${{ steps.capture_error.outputs.failed_step }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Derive multidev name from epic branch
+        id: derive
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          # Branch name shape: epic/<TICKET-ID>[-<short-description>]
+          # e.g. epic/PROJ-757 or epic/PROJ-757-event-listing-system
+          # Extract the ticket ID (letters then -number), then take the numeric
+          # tail for the epr-<NNN> multidev name.
+          if [[ "${BRANCH_NAME}" != epic/* ]]; then
+            echo "Error: branch '${BRANCH_NAME}' does not match epic/* pattern"
+            exit 1
+          fi
+
+          # Strip the epic/ prefix; what remains starts with the TICKET-ID.
+          REMAINDER="${BRANCH_NAME#epic/}"
+
+          # Match the leading TICKET-ID (e.g. PROJ-757, YCBE-101).
+          TICKET_ID=$(echo "$REMAINDER" | grep -oP '^[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+          if [[ -z "$TICKET_ID" ]]; then
+            echo "Error: could not extract TICKET-ID from branch '${BRANCH_NAME}'"
+            echo "Expected pattern: epic/<LETTERS-DIGITS-NUMBER>[-description]"
+            exit 1
+          fi
+
+          # The multidev name uses just the numeric portion.
+          NNN="${TICKET_ID##*-}"
+          TARGET_ENV="epr-${NNN}"
+
+          # Sanity check: Pantheon caps multidev names at 11 characters.
+          if [[ ${#TARGET_ENV} -gt 11 ]]; then
+            echo "Error: derived multidev name '${TARGET_ENV}' exceeds Pantheon's 11-char limit"
+            exit 1
+          fi
+
+          echo "epic_ticket_id=${TICKET_ID}" >> $GITHUB_OUTPUT
+          echo "target_env=${TARGET_ENV}" >> $GITHUB_OUTPUT
+          echo "Epic ticket: ${TICKET_ID}"
+          echo "Epic multidev: ${TARGET_ENV}"
+
+      - name: Install Terminus
+        uses: ./.github/actions/terminus-install
+        with:
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+
+      - name: Check if epic multidev environment exists
+        id: check_env
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+        run: |
+          echo "Checking if ${SITE}.${TARGET_ENV} exists..."
+          if terminus env:info "${SITE}.${TARGET_ENV}" >/dev/null 2>&1; then
+            echo "env_is_new=false" >> $GITHUB_OUTPUT
+            echo "Epic multidev exists, will be updated"
+          else
+            echo "env_is_new=true" >> $GITHUB_OUTPUT
+            echo "Epic multidev is new, will be created"
+          fi
+
+      - name: Push code to Pantheon epic multidev
+        id: deploy
+        uses: ./.github/actions/pantheon-push
+        with:
+          site: ${{ inputs.pantheon_site }}
+          target_env: ${{ steps.derive.outputs.target_env }}
+          source_env: dev
+          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          commit_message: 'Automated deployment from GitHub Actions to epic multidev ${{ steps.derive.outputs.target_env }}'
+
+      - name: Run post-deploy drush commands
+        id: drush_commands
+        uses: ./.github/actions/pantheon-post-deploy-drush
+        with:
+          site: ${{ inputs.pantheon_site }}
+          env: ${{ steps.derive.outputs.target_env }}
+          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          skip: ${{ inputs.workflow_skip_terminus }}
+          # No pr_title for push events; [config-first] / [verbose] flags don't apply.
+          pr_title: ''
+
+      - name: Get epic multidev URL
+        id: multidev_url
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+        run: |
+          URL=$(terminus env:view "${SITE}.${TARGET_ENV}" --print)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Epic multidev available at: $URL"
+
+      - name: Comment on ClickUp epic ticket with multidev URL
+        continue-on-error: true
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+          MULTIDEV_URL: ${{ steps.multidev_url.outputs.url }}
+          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
+          ENV_IS_NEW: ${{ steps.check_env.outputs.env_is_new }}
+          EPIC_TICKET_ID: ${{ steps.derive.outputs.epic_ticket_id }}
+          REPO: ${{ github.repository }}
+          SITE: ${{ inputs.pantheon_site }}
+        run: |
+          if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
+            echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set, skipping ClickUp comment"
+            exit 0
+          fi
+          ACTION=$([[ "$ENV_IS_NEW" == "true" ]] && echo "created" || echo "updated")
+          RESPONSE=$(curl -s -o /tmp/clickup_response.json -w "%{http_code}" -X POST \
+            "https://api.clickup.com/api/v2/task/${EPIC_TICKET_ID}/comment?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}" \
+            -H "Authorization: ${CLICKUP_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment_text\": \"The Epic Integration Multidev environment was ${ACTION}: ${MULTIDEV_URL}\n\nEnvironment: ${TARGET_ENV}\nSite: ${SITE}\nEpic branch: $(echo '${{ github.ref_name }}')\"}" || true)
+          echo "ClickUp API response code: $RESPONSE"
+          cat /tmp/clickup_response.json || true
+          if [[ "$RESPONSE" != "200" ]]; then
+            echo "Warning: ClickUp comment may not have been posted (HTTP $RESPONSE)"
+          fi
+
+      - name: Capture error information
+        id: capture_error
+        if: ${{ failure() }}
+        run: |
+          if [[ "${{ steps.derive.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Epic Branch Name Parsing" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to parse epic ticket ID from branch name. Expected pattern: epic/<TICKET-ID>[-description]" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.deploy.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Epic Multidev Deployment" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to deploy to epic multidev. Check deployment logs." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.drush_commands.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Drush Commands" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to run drush updb/cim/cr on epic multidev." >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.multidev_url.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Multidev URL" >> $GITHUB_OUTPUT
+            echo "error_message=Failed to retrieve epic multidev URL from Pantheon." >> $GITHUB_OUTPUT
+          else
+            echo "failed_step=Unknown" >> $GITHUB_OUTPUT
+            echo "error_message=Epic multidev deployment failed at an unknown step." >> $GITHUB_OUTPUT
+          fi
+
+  security_scan:
+    name: Security Scan (mandatory on epr-*)
+    needs: deploy_epic_multidev
+    # The security workflow detects epr-* internally and runs unconditionally
+    # in strict mode (fails on any High-severity finding) — same gate as rc-*,
+    # per the Square360 SOP for epic integration multidevs. No force_run needed.
+    uses: ./.github/workflows/reusable-pantheon-security-scan.yml
+    with:
+      pantheon_site: ${{ inputs.pantheon_site }}
+      target_env: ${{ needs.deploy_epic_multidev.outputs.target_env }}
+      slack_channel: ${{ inputs.slack_channel }}
+    secrets: inherit
+
+  notify_slack:
+    name: Notify Slack
+    needs: deploy_epic_multidev
+    if: ${{ always() && inputs.slack_channel }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          DEPLOY_RESULT: ${{ needs.deploy_epic_multidev.result }}
+          MULTIDEV_URL: ${{ needs.deploy_epic_multidev.outputs.multidev_url }}
+          TARGET_ENV: ${{ needs.deploy_epic_multidev.outputs.target_env }}
+          EPIC_TICKET_ID: ${{ needs.deploy_epic_multidev.outputs.epic_ticket_id }}
+          FAILED_STEP: ${{ needs.deploy_epic_multidev.outputs.failed_step }}
+          ERROR_MESSAGE: ${{ needs.deploy_epic_multidev.outputs.error_message }}
+          REPO: ${{ github.repository }}
+          SITE: ${{ inputs.pantheon_site }}
+          RUN_ID: ${{ github.run_id }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
+            exit 0
+          fi
+
+          case "$DEPLOY_RESULT" in
+            success)   STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success"   ;;
+            failure)   STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed"    ;;
+            cancelled) STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled" ;;
+            *)         STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown"   ;;
+          esac
+
+          ENV_URL_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "success" && -n "$MULTIDEV_URL" ]]; then
+            ENV_URL_FIELD=",{\"title\": \"Epic Multidev URL\", \"value\": \"<${MULTIDEV_URL}|${MULTIDEV_URL}>\", \"short\": false}"
+          fi
+
+          EPIC_FIELD=""
+          if [[ -n "$EPIC_TICKET_ID" ]]; then
+            EPIC_FIELD=",{\"title\": \"Epic Ticket\", \"value\": \"${EPIC_TICKET_ID}\", \"short\": true},{\"title\": \"Branch\", \"value\": \"${BRANCH}\", \"short\": true}"
+          fi
+
+          ERROR_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
+            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
+            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
+            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          fi
+
+          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-type: application/json; charset=utf-8' \
+            --data "{
+              \"channel\": \"${SLACK_CHANNEL}\",
+              \"text\": \"${STATUS_EMOJI} Epic Multidev Deployment ${STATUS_TEXT}\",
+              \"attachments\": [
+                {
+                  \"color\": \"${STATUS_COLOR}\",
+                  \"fields\": [
+                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
+                    {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\", \"short\": true},
+                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
+                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
+                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
+                    ${EPIC_FIELD}
+                    ${ENV_URL_FIELD}
+                    ${ERROR_FIELD}
+                  ],
+                  \"footer\": \"GitHub Actions\",
+                  \"ts\": $(date +%s)
+                }
+              ]
+            }" \
+            https://slack.com/api/chat.postMessage

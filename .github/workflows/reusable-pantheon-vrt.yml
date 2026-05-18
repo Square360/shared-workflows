@@ -1,0 +1,961 @@
+name: Reusable Visual Regression Test
+
+on:
+  workflow_call:
+    inputs:
+      pantheon_site:
+        description: 'Pantheon site machine name'
+        required: true
+        type: string
+      target_env:
+        description: 'Target environment name (e.g. rc-2025-12 or pr-42)'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications'
+        required: false
+        type: string
+      force_run:
+        description: 'Skip [run-vrt] tag check and run unconditionally (for manual triggers)'
+        required: false
+        type: boolean
+        default: false
+      pr_head_ref:
+        description: 'PR head branch name — used for ClickUp ID fallback on manual runs'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      PANTHEON_MACHINE_TOKEN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_S3_BUCKET:
+        required: true
+      AWS_S3_REGION:
+        required: false
+      CLICKUP_API_TOKEN:
+        required: false
+      CLICKUP_TEAM_ID:
+        required: false
+      SLACK_BOT_TOKEN:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  visual_regression:
+    name: Visual Regression Test
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+
+    # -------------------------------------------------------------------------
+    # Step 1: Parse [run-vrt] tag from the PR body.
+    #
+    # Detects (both flag names supported for back-compat):
+    #   [run-vrt]              — run VRT, no ClickUp comment
+    #   [run-vrt YMAC-959]     — run VRT, post results to that ClickUp task
+    #   [vrt]                  — legacy alias for [run-vrt]
+    #   [vrt YMAC-959]         — legacy alias for [run-vrt YMAC-959]
+    #
+    # The new canonical flag is [run-vrt] (matches the [run-X] / [skip-X] /
+    # [X-only] convention documented in the SOP). [vrt] is accepted indefinitely
+    # so existing PRs and developer muscle memory don't break.
+    #
+    # If no explicit task ID is found, falls back to scanning the branch name
+    # for a ClickUp-style ID (e.g. ymac-959-my-feature → YMAC-959).
+    #
+    # Also parses an optional [vrt-pages]...[/vrt-pages] block for extra paths
+    # to test in addition to those in .github/workflow_config/vrt-config.yml:
+    #
+    #   [vrt-pages]
+    #   /seasonal/christmas-sale
+    #   /landing/special-promo
+    #   [/vrt-pages]
+    #
+    # The [vrt-pages] block keeps its original name regardless of which run
+    # flag is used — it's a content selector, not a run trigger.
+    # -------------------------------------------------------------------------
+    - name: Parse [run-vrt] tag from PR body
+      id: vrt_check
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: |
+        FORCE_RUN="${{ inputs.force_run }}"
+
+        if [[ "$FORCE_RUN" == "true" ]]; then
+          echo "Manual trigger — skipping [run-vrt] tag check"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          # No PR body to parse — resolve ClickUp ID from pr_head_ref if provided
+          BRANCH="${{ inputs.pr_head_ref }}"
+          TASK_ID=$(echo "$BRANCH" | grep -oiP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          echo "clickup_task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+          echo "extra_pages=" >> "$GITHUB_OUTPUT"
+          echo "ClickUp task ID: ${TASK_ID:-none}"
+          exit 0
+        fi
+
+        if [[ -z "$PR_BODY" ]] || ! echo "$PR_BODY" | grep -qP '\[(run-vrt|vrt)\b'; then
+          echo "No [run-vrt] or [vrt] tag found in PR body — skipping VRT"
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
+        echo "[run-vrt] tag detected (or legacy [vrt])"
+
+        # Extract optional ClickUp task ID from the tag itself: [run-vrt YMAC-959] or [vrt YMAC-959]
+        TASK_ID=$(echo "$PR_BODY" | grep -oP '\[(run-vrt|vrt)\s+([A-Z][A-Z0-9]+-[0-9]+)' | grep -oP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+
+        # Fallback: scan branch name (e.g. feature/ymac-959-my-feature → YMAC-959)
+        if [[ -z "$TASK_ID" ]]; then
+          BRANCH="${{ inputs.pr_head_ref || github.head_ref }}"
+          TASK_ID=$(echo "$BRANCH" | grep -oiP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          if [[ -n "$TASK_ID" ]]; then
+            echo "ClickUp task ID resolved from branch name: ${TASK_ID}"
+          fi
+        fi
+
+        echo "clickup_task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+        echo "ClickUp task ID: ${TASK_ID:-none}"
+
+        # Extract extra paths from the [vrt-pages]...[/vrt-pages] block.
+        # Each line is an absolute path with an optional wait override after a pipe:
+        #   /seasonal/sale
+        #   /our-work|9        ← wait 9s on this page instead of the global default
+        # Entries are tab-separated in the output (tabs cannot appear in paths or
+        # wait values) so the pipe character stays available as the path/wait separator.
+        EXTRA_PAGES=$(printf '%s' "$PR_BODY" \
+          | sed -n '/\[vrt-pages\]/,/\[\/vrt-pages\]/p' \
+          | grep -E '^\s*/' \
+          | sed 's/^\s*//' \
+          | paste -sd $'\t' - || true)
+        echo "extra_pages=${EXTRA_PAGES}" >> "$GITHUB_OUTPUT"
+        if [[ -n "$EXTRA_PAGES" ]]; then
+          echo "Extra pages from PR body: ${EXTRA_PAGES}"
+        fi
+
+    - name: Checkout
+      if: steps.vrt_check.outputs.enabled == 'true'
+      uses: actions/checkout@v6
+
+    - name: Install Terminus
+      if: steps.vrt_check.outputs.enabled == 'true'
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+      run: |
+        TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+        curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" \
+          -o /usr/local/bin/terminus
+        chmod +x /usr/local/bin/terminus
+        terminus auth:login --machine-token="$TERMINUS_MACHINE_TOKEN"
+
+    - name: Get site URLs
+      id: get_urls
+      if: steps.vrt_check.outputs.enabled == 'true'
+      run: |
+        LIVE_URL=$(terminus env:view ${{ inputs.pantheon_site }}.live --print 2>/dev/null \
+          | grep -oE 'https?://[^[:space:]]+' | head -1 | tr -d '[:space:]')
+        RC_URL=$(terminus env:view ${{ inputs.pantheon_site }}.${{ inputs.target_env }} --print 2>/dev/null \
+          | grep -oE 'https?://[^[:space:]]+' | head -1 | tr -d '[:space:]')
+
+        if [[ -z "$LIVE_URL" ]]; then
+          echo "Error: could not get LIVE URL from Terminus for ${{ inputs.pantheon_site }}.live"
+          exit 1
+        fi
+        if [[ -z "$RC_URL" ]]; then
+          echo "Error: could not get RC URL from Terminus for ${{ inputs.pantheon_site }}.${{ inputs.target_env }}"
+          exit 1
+        fi
+
+        echo "live_url=${LIVE_URL}" >> "$GITHUB_OUTPUT"
+        echo "rc_url=${RC_URL}"     >> "$GITHUB_OUTPUT"
+        echo "LIVE URL : ${LIVE_URL}"
+        echo "RC URL   : ${RC_URL}"
+
+    # -------------------------------------------------------------------------
+    # Compute the S3 base URL up front so vrt.mjs can embed absolute image and
+    # report URLs in report.json before the upload step runs. Filenames are
+    # deterministic (slug-based), so the URLs are valid as soon as the upload
+    # step completes — no post-upload rewrite required.
+    # -------------------------------------------------------------------------
+    - name: Compute S3 URLs
+      id: s3_urls
+      if: steps.vrt_check.outputs.enabled == 'true'
+      env:
+        AWS_S3_BUCKET:       ${{ secrets.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT: ${{ secrets.AWS_S3_REGION }}
+        PANTHEON_SITE:       ${{ inputs.pantheon_site }}
+      run: |
+        REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
+        RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        BASE_URL="https://${AWS_S3_BUCKET}.s3.${REGION}.amazonaws.com/${PANTHEON_SITE}/${RUN_KEY}"
+        echo "base_url=${BASE_URL}" >> "$GITHUB_OUTPUT"
+        echo "run_key=${RUN_KEY}"   >> "$GITHUB_OUTPUT"
+        echo "region=${REGION}"     >> "$GITHUB_OUTPUT"
+        echo "S3 base URL: ${BASE_URL}"
+
+    - name: Setup Node.js
+      if: steps.vrt_check.outputs.enabled == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Playwright and dependencies
+      if: steps.vrt_check.outputs.enabled == 'true'
+      run: |
+        npm install --no-save playwright pixelmatch pngjs js-yaml
+        npx playwright install chromium --with-deps
+
+    # -------------------------------------------------------------------------
+    # Write the VRT script to vrt.mjs.
+    # Uses a quoted heredoc so JS template literals and $VARS are not expanded.
+    # -------------------------------------------------------------------------
+    - name: Write VRT script
+      if: steps.vrt_check.outputs.enabled == 'true'
+      run: |
+        cat > vrt.mjs << 'VRTEOF'
+        import { chromium } from 'playwright';
+        import { PNG } from 'pngjs';
+        import pixelmatch from 'pixelmatch';
+        import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+        import jsYaml from 'js-yaml';
+
+        const LIVE_URL        = (process.env.LIVE_URL || '').replace(/\/$/, '');
+        const RC_URL          = (process.env.RC_URL || '').replace(/\/$/, '');
+        const TARGET_ENV      = process.env.TARGET_ENV || '';
+        const PANTHEON_SITE   = process.env.PANTHEON_SITE || '';
+        const EXTRA_PAGES_RAW = process.env.EXTRA_PAGES || '';
+        const RUN_ID          = process.env.GITHUB_RUN_ID || 'local';
+        const RUN_ATTEMPT     = process.env.GITHUB_RUN_ATTEMPT || '1';
+        const REPO            = process.env.GITHUB_REPO || '';
+        const COMMIT_SHA      = process.env.GITHUB_COMMIT_SHA || '';
+        const PR_NUMBER_RAW   = process.env.GITHUB_PR_NUMBER || '';
+        const PR_NUMBER       = PR_NUMBER_RAW ? parseInt(PR_NUMBER_RAW, 10) : null;
+        const BRANCH          = process.env.GITHUB_BRANCH || '';
+        const EVENT_NAME      = process.env.GITHUB_EVENT_NAME || '';
+        const S3_BASE_URL     = (process.env.S3_BASE_URL || '').replace(/\/$/, '');
+        const CONFIG_PATH     = '.github/workflow_config/vrt-config.yml';
+        const SCHEMA_VERSION  = '1.0';
+
+        const DEFAULT_CONFIG = {
+          vrt: {
+            threshold: 0.05,
+            fail_on_diff: false,
+            wait: 6,
+            viewports: [
+              { width: 1440, height: 2880, name: 'desktop' },
+              { width: 390,  height: 844,  name: 'mobile'  },
+            ],
+            pages: [{ path: '/', name: 'homepage' }],
+          },
+        };
+
+        let config = DEFAULT_CONFIG;
+        if (existsSync(CONFIG_PATH)) {
+          try {
+            config = jsYaml.load(readFileSync(CONFIG_PATH, 'utf8'));
+            console.log('Loaded vrt-config.yml');
+          } catch (e) {
+            console.warn(`Failed to parse vrt-config.yml, using defaults: ${e.message}`);
+            config = DEFAULT_CONFIG;
+          }
+        } else {
+          console.log('No vrt-config.yml found — using defaults (homepage, desktop + mobile)');
+        }
+
+        const threshold   = config.vrt?.threshold    ?? 0.05;
+        const failOnDiff  = config.vrt?.fail_on_diff ?? false;
+        const defaultWait = config.vrt?.wait         ?? 6;
+        const viewports   = config.vrt?.viewports    ?? DEFAULT_CONFIG.vrt.viewports;
+        const pages       = [...(config.vrt?.pages   ?? DEFAULT_CONFIG.vrt.pages)];
+
+        // Merge extra paths from the [vrt-pages] block in the PR body.
+        // Entries are tab-separated; each entry is /path or /path|waitSeconds.
+        if (EXTRA_PAGES_RAW) {
+          for (const raw of EXTRA_PAGES_RAW.split('\t').filter(Boolean)) {
+            const [pagePath, waitStr] = raw.trim().split('|');
+            if (pagePath && !pages.find(p => p.path === pagePath)) {
+              const slug = pagePath.replace(/^\//, '').replace(/\//g, '-') || 'root';
+              const wait = waitStr ? parseInt(waitStr, 10) : undefined;
+              pages.push({ path: pagePath, name: slug, ...(wait ? { wait } : {}) });
+              console.log(`  + Extra page from PR body: ${pagePath}${wait ? ` (wait:${wait}s)` : ''}`);
+            }
+          }
+        }
+
+        console.log(`\nPages     : ${pages.map(p => p.path + (p.wait != null ? ` (wait:${p.wait}s)` : '')).join(', ')} (${pages.length})`);
+        console.log(`Viewports : ${viewports.map(v => v.name).join(', ')} (${viewports.length})`);
+        console.log(`Threshold : ${(threshold * 100).toFixed(1)}%  |  fail_on_diff: ${failOnDiff}  |  default wait: ${defaultWait}s\n`);
+
+        for (const dir of ['screenshots/live', 'screenshots/rc', 'screenshots/diff']) {
+          mkdirSync(dir, { recursive: true });
+        }
+
+        // Injected into every page before screenshotting:
+        //  - freeze CSS animations/transitions so they don't cause false diffs
+        const VRT_STYLE = [
+          '*, *::before, *::after { animation-duration: 0.001s !important; animation-delay: 0s !important; transition-duration: 0.001s !important; transition-delay: 0s !important; }',
+        ].join('\n');
+
+        // Pad the shorter image with white so pixelmatch gets equal-sized inputs.
+        // This handles pages where LIVE and RC have different content lengths.
+        function padImage(img, targetWidth, targetHeight) {
+          if (img.width === targetWidth && img.height === targetHeight) return img;
+          const out = new PNG({ width: targetWidth, height: targetHeight });
+          for (let i = 0; i < out.data.length; i += 4) {
+            out.data[i] = 255; out.data[i+1] = 255; out.data[i+2] = 255; out.data[i+3] = 255;
+          }
+          for (let y = 0; y < Math.min(img.height, targetHeight); y++) {
+            for (let x = 0; x < Math.min(img.width, targetWidth); x++) {
+              const si = (y * img.width + x) * 4;
+              const di = (y * targetWidth + x) * 4;
+              out.data.set(img.data.subarray(si, si + 4), di);
+            }
+          }
+          return out;
+        }
+
+        function b64(filePath) {
+          if (!filePath || !existsSync(filePath)) return null;
+          return readFileSync(filePath).toString('base64');
+        }
+
+        const results = [];
+        const browser = await chromium.launch();
+
+        for (const viewport of viewports) {
+          const ctx  = await browser.newContext({
+            viewport: { width: viewport.width, height: viewport.height },
+            reducedMotion: 'reduce',
+          });
+          const page = await ctx.newPage();
+
+          for (const pageConfig of pages) {
+            const slug     = `${pageConfig.name}-${viewport.name}`;
+            const liveFile = `screenshots/live/${slug}.png`;
+            const rcFile   = `screenshots/rc/${slug}.png`;
+            const diffFile = `screenshots/diff/${slug}.png`;
+
+            let error              = null;
+            let baselineLoadMs     = null;
+            let candidateLoadMs    = null;
+            let compareMs          = null;
+            let baselineCapturedAt = null;
+            let candidateCapturedAt = null;
+            try {
+              const waitMs = (pageConfig.wait ?? defaultWait) * 1000;
+
+              const tBaseline = Date.now();
+              await page.goto(`${LIVE_URL}${pageConfig.path}`, { waitUntil: 'networkidle', timeout: 30000 });
+              await page.addStyleTag({ content: VRT_STYLE });
+              await page.waitForTimeout(waitMs);
+              await page.screenshot({ path: liveFile, fullPage: true });
+              baselineLoadMs     = Date.now() - tBaseline;
+              baselineCapturedAt = new Date().toISOString();
+
+              const tCandidate = Date.now();
+              await page.goto(`${RC_URL}${pageConfig.path}`, { waitUntil: 'networkidle', timeout: 30000 });
+              await page.addStyleTag({ content: VRT_STYLE });
+              await page.waitForTimeout(waitMs);
+              await page.screenshot({ path: rcFile, fullPage: true });
+              candidateLoadMs     = Date.now() - tCandidate;
+              candidateCapturedAt = new Date().toISOString();
+
+              const tCompare = Date.now();
+              const liveRaw = PNG.sync.read(readFileSync(liveFile));
+              const rcRaw   = PNG.sync.read(readFileSync(rcFile));
+              const w = Math.max(liveRaw.width,  rcRaw.width);
+              const h = Math.max(liveRaw.height, rcRaw.height);
+              const liveImg = padImage(liveRaw, w, h);
+              const rcImg   = padImage(rcRaw,   w, h);
+
+              const diff   = new PNG({ width: w, height: h });
+              const diffPx = pixelmatch(liveImg.data, rcImg.data, diff.data, w, h, { threshold: 0.1 });
+              writeFileSync(diffFile, PNG.sync.write(diff));
+              compareMs = Date.now() - tCompare;
+
+              const totalPx  = w * h;
+              const diffRatio = diffPx / totalPx;
+              const passed    = diffRatio <= threshold;
+
+              results.push({
+                page: pageConfig.name, path: pageConfig.path, viewport: viewport.name, slug,
+                width: w, height: h, diffPixels: diffPx, totalPixels: totalPx,
+                diffRatio:   parseFloat(diffRatio.toFixed(6)),
+                diffPercent: parseFloat((diffRatio * 100).toFixed(2)),
+                passed, liveFile, rcFile, diffFile, error: null,
+                baselineLoadMs, candidateLoadMs, compareMs,
+                baselineCapturedAt, candidateCapturedAt,
+              });
+
+              console.log(`${passed ? '✅' : '❌'} ${pageConfig.name} @ ${viewport.name}: ${(diffRatio * 100).toFixed(2)}% diff (${diffPx} px)`);
+            } catch (e) {
+              error = e.message;
+              console.error(`⚠️  ${pageConfig.name} @ ${viewport.name}: ${e.message}`);
+              results.push({
+                page: pageConfig.name, path: pageConfig.path, viewport: viewport.name, slug,
+                diffPixels: 0, totalPixels: 0, diffRatio: 0, diffPercent: 0,
+                passed: false, liveFile: null, rcFile: null, diffFile: null, error,
+                baselineLoadMs, candidateLoadMs, compareMs,
+                baselineCapturedAt, candidateCapturedAt,
+              });
+            }
+          }
+
+          await ctx.close();
+        }
+
+        await browser.close();
+
+        const allPassed  = results.every(r => r.passed);
+        const passCount  = results.filter(r => r.passed).length;
+        const failCount  = results.length - passCount;
+
+        // -----------------------------------------------------------------------
+        // HTML report — self-contained, all screenshots base64-encoded inline.
+        // -----------------------------------------------------------------------
+        const htmlRows = results.map(r => {
+          const statusCell = r.error ? '⚠️ Error' : (r.passed ? '✅ Pass' : '❌ Fail');
+          const rowClass   = r.passed ? '' : 'fail-row';
+          const liveB64    = b64(r.liveFile);
+          const rcB64      = b64(r.rcFile);
+          const diffB64    = b64(r.diffFile);
+
+          const diffCell = r.error
+            ? `<span class="err">${r.error}</span>`
+            : `${r.diffPercent}% (${r.diffPixels} px)`;
+
+          // Side-by-side grid: live | diff | rc
+          const gridHtml = [
+            liveB64 ? `<div><div class="lbl">LIVE</div><img src="data:image/png;base64,${liveB64}"></div>` : '',
+            diffB64 ? `<div><div class="lbl">DIFF — ${r.diffPercent}%</div><img src="data:image/png;base64,${diffB64}"></div>` : '',
+            rcB64   ? `<div><div class="lbl">Multidev (${TARGET_ENV})</div><img src="data:image/png;base64,${rcB64}"></div>` : '',
+          ].filter(Boolean).join('');
+
+          // Slider view: img-comparison-slider web component (Option B — jsDelivr CDN)
+          const sliderHtml = (liveB64 && rcB64) ? `
+            <img-comparison-slider style="max-width:100%;display:block;">
+              <figure slot="first" style="margin:0">
+                <img src="data:image/png;base64,${liveB64}" style="width:100%;display:block">
+                <figcaption class="slider-lbl">LIVE</figcaption>
+              </figure>
+              <figure slot="second" style="margin:0">
+                <img src="data:image/png;base64,${rcB64}" style="width:100%;display:block">
+                <figcaption class="slider-lbl slider-lbl--right">Multidev (${TARGET_ENV})</figcaption>
+              </figure>
+            </img-comparison-slider>` : '';
+
+          if (!gridHtml) {
+            return `
+            <tr class="${rowClass}">
+              <td>${statusCell}</td>
+              <td>${r.page}</td>
+              <td><code>${r.path}</code></td>
+              <td>${r.viewport} (${r.width}×${r.height})</td>
+              <td>${diffCell}</td>
+            </tr>`;
+          }
+
+          return `
+            <tr class="${rowClass}">
+              <td>${statusCell}</td>
+              <td>${r.page}</td>
+              <td><code>${r.path}</code></td>
+              <td>${r.viewport} (${r.width}×${r.height})</td>
+              <td>${diffCell}</td>
+            </tr>
+            <tr class="${rowClass}">
+              <td colspan="5">
+                <div class="result-images">
+                  ${sliderHtml ? `<div class="view-toggles">
+                    <button class="view-toggle active" data-mode="side">Side by Side</button>
+                    <button class="view-toggle" data-mode="slider">Slider</button>
+                  </div>` : ''}
+                  <div class="grid">${gridHtml}</div>
+                  ${sliderHtml ? `<div class="slider-view" style="display:none">${sliderHtml}</div>` : ''}
+                </div>
+              </td>
+            </tr>`;
+        }).join('\n');
+
+        const html = `<!DOCTYPE html>
+        <html><head><meta charset="utf-8">
+        <title>VRT · ${PANTHEON_SITE} · ${TARGET_ENV}</title>
+        <script type="module" src="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/index.js"><\/script>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/styles.css">
+        <style>
+          body { font-family: sans-serif; padding: 2rem; max-width: 1600px; margin: 0 auto; }
+          .report-title { display: flex; align-items: baseline; gap: 10px; margin-bottom: .25rem; }
+          .report-title img { width: 75px; height: 75px; vertical-align: baseline; position: relative; top: .45em; }
+          h1   { margin: 0; }
+          .meta { color: #555; margin-bottom: 1.5rem; font-size: .9rem; }
+          .banner { padding: 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 1.1rem; }
+          .pass { background: #d4edda; color: #155724; }
+          .fail { background: #f8d7da; color: #721c24; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { padding: .5rem 1rem; border: 1px solid #ddd; text-align: left; vertical-align: top; }
+          th { background: #f8f9fa; }
+          .fail-row td { background: #fff3f3; }
+          .grid { display: flex; gap: 1rem; padding: .5rem 0; flex-wrap: wrap; }
+          .grid > div { flex: 1; min-width: 220px; }
+          .grid img { max-width: 100%; border: 1px solid #ddd; display: block; }
+          .lbl { font-size: .75rem; font-weight: bold; color: #555; margin-bottom: .25rem; }
+          .err { color: #dc3545; }
+          code { background: #f8f9fa; padding: .1rem .3rem; border-radius: 3px; }
+          footer { margin-top: 2rem; color: #888; font-size: .85rem; }
+          /* View toggle buttons */
+          .view-toggles { display: flex; gap: 0; margin-bottom: .5rem; }
+          .view-toggle { padding: 4px 12px; cursor: pointer; border: 1px solid #ccc; background: #fff; font-size: .8rem; }
+          .view-toggle:first-child { border-radius: 4px 0 0 4px; }
+          .view-toggle:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+          .view-toggle.active { background: #333; color: #fff; border-color: #333; }
+          /* img-comparison-slider — divider and handle styling */
+          img-comparison-slider {
+            --divider-width: 4px;
+            --divider-color: #66FF00;
+            --default-handle-opacity: 1;
+            --default-handle-color: #66FF00;
+            --default-handle-shadow: 0 0 0 3px rgba(0,0,0,0.55), 0 2px 10px rgba(0,0,0,0.5);
+          }
+          /* img-comparison-slider labels */
+          .slider-lbl { position: absolute; bottom: .4rem; left: .5rem; font-size: .7rem; font-weight: bold; color: #fff; text-transform: uppercase; background: rgba(0,0,0,.45); padding: 2px 6px; border-radius: 3px; pointer-events: none; }
+          .slider-lbl--right { left: auto; right: .5rem; }
+        </style></head>
+        <body>
+        <div class="report-title">
+          <img src="https://d17zcn6u0welhn.cloudfront.net/Square360-Assets/S360-logo-black-300.png" alt="Square360 Logo" width="75" height="75">
+          <h1>Square360 Visual Regression Test Report</h1>
+        </div>
+        <p class="meta">
+          <strong>Site:</strong> ${PANTHEON_SITE} &nbsp;·&nbsp;
+          <strong>Env:</strong> ${TARGET_ENV} vs live &nbsp;·&nbsp;
+          <strong>Multidev:</strong> <a href="${RC_URL}">${RC_URL}</a> &nbsp;·&nbsp;
+          <strong>Run:</strong> #${RUN_ID}
+        </p>
+        <div class="banner ${allPassed ? 'pass' : 'fail'}">
+          ${allPassed ? '✅ All checks passed' : '❌ Some checks failed'} —
+          ${passCount} passed, ${failCount} failed &nbsp;·&nbsp; Threshold: ${(threshold * 100).toFixed(1)}%
+        </div>
+        <table>
+          <thead>
+            <tr><th>Status</th><th>Page</th><th>Path</th><th>Viewport</th><th>Diff / Error</th></tr>
+          </thead>
+          <tbody>${htmlRows}</tbody>
+        </table>
+        <footer>Generated by reusable-pantheon-vrt.yml</footer>
+        <script>
+          document.querySelectorAll('.view-toggle').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var wrap = this.closest('.result-images');
+              var mode = this.dataset.mode;
+              wrap.querySelector('.grid').style.display        = mode === 'side'   ? 'flex'  : 'none';
+              wrap.querySelector('.slider-view').style.display = mode === 'slider' ? 'block' : 'none';
+              wrap.querySelectorAll('.view-toggle').forEach(function(b) {
+                b.classList.toggle('active', b === btn);
+              });
+            });
+          });
+        <\/script>
+        </body></html>`;
+
+        writeFileSync('report.html', html);
+
+        // -----------------------------------------------------------------------
+        // vrt-summary.json — consumed by the PR comment and assertion steps.
+        // Kept as-is for internal backward compatibility.
+        // -----------------------------------------------------------------------
+        writeFileSync('vrt-summary.json', JSON.stringify({
+          allPassed, passCount, failCount,
+          threshold, thresholdPercent: parseFloat((threshold * 100).toFixed(1)),
+          failOnDiff, results,
+        }, null, 2));
+
+        // -----------------------------------------------------------------------
+        // report.json — spec-compliant machine-readable summary for AI consumers.
+        // Schema: see docs/2026-04-21-vrt-json-report-spec.md (schema_version 1.0).
+        // Emitted alongside report.html; URLs are absolute S3 paths.
+        // -----------------------------------------------------------------------
+        function classifyError(message) {
+          if (!message) return 'unknown';
+          const m = String(message).toLowerCase();
+          if (m.includes('timeout') || m.includes('timed out'))  return 'timeout';
+          if (m.includes('net::') || m.includes('err_') ||
+              m.includes('navigation') || m.includes('goto'))     return 'navigation_failed';
+          if (m.includes('screenshot'))                           return 'screenshot_failed';
+          if (m.includes('pixelmatch') || m.includes('compare') ||
+              m.includes('png'))                                  return 'compare_failed';
+          return 'unknown';
+        }
+
+        function idSlug(pageName, viewportName) {
+          return `${String(pageName).toLowerCase().replace(/\s+/g, '_')}__${String(viewportName).toLowerCase().replace(/\s+/g, '_')}`;
+        }
+
+        const erroredCount = results.filter(r => r.error).length;
+        const summaryFailed = results.filter(r => !r.error && !r.passed).length;
+        const summaryPassed = results.filter(r => r.passed).length;
+
+        let overallStatus;
+        if (results.length === 0)                         overallStatus = 'errored';
+        else if (erroredCount === results.length)         overallStatus = 'errored';
+        else if (summaryPassed === results.length)        overallStatus = 'passed';
+        else                                              overallStatus = 'failed';
+
+        const maxDiffRatio = results
+          .filter(r => !r.error)
+          .reduce((m, r) => Math.max(m, r.diffRatio), 0);
+
+        const baselineTimestamps  = results.map(r => r.baselineCapturedAt).filter(Boolean).sort();
+        const candidateTimestamps = results.map(r => r.candidateCapturedAt).filter(Boolean).sort();
+
+        const htmlReportUrl = S3_BASE_URL ? `${S3_BASE_URL}/report.html` : null;
+        const jsonReportUrl = S3_BASE_URL ? `${S3_BASE_URL}/report.json` : null;
+
+        const testsJson = results.map(r => {
+          const vpDef  = viewports.find(v => v.name === r.viewport) || {};
+          const status = r.error ? 'errored' : (r.passed ? 'passed' : 'failed');
+          return {
+            id: idSlug(r.page, r.viewport),
+            page_name: r.page,
+            path: r.path,
+            viewport: {
+              name: r.viewport,
+              width: vpDef.width ?? r.width ?? null,
+              height: vpDef.height ?? r.height ?? null,
+            },
+            status,
+            diff_ratio: r.diffRatio,
+            diff_pixels: r.diffPixels,
+            threshold,
+            over_threshold: r.error ? false : (r.diffRatio > threshold),
+            durations_ms: {
+              baseline_load:  r.baselineLoadMs  ?? null,
+              candidate_load: r.candidateLoadMs ?? null,
+              compare:        r.compareMs       ?? null,
+            },
+            images: {
+              baseline_url:  (r.liveFile && S3_BASE_URL) ? `${S3_BASE_URL}/live/${r.slug}.png` : null,
+              candidate_url: (r.rcFile   && S3_BASE_URL) ? `${S3_BASE_URL}/rc/${r.slug}.png`   : null,
+              diff_url:      (r.diffFile && S3_BASE_URL) ? `${S3_BASE_URL}/diff/${r.slug}.png` : null,
+            },
+            error: r.error ? { message: r.error, type: classifyError(r.error) } : null,
+          };
+        });
+
+        const report = {
+          schema_version: SCHEMA_VERSION,
+          generated_at: new Date().toISOString(),
+          run: {
+            id: RUN_ID,
+            attempt: parseInt(RUN_ATTEMPT, 10) || 1,
+            workflow: 'reusable-pantheon-vrt.yml',
+            repo: REPO,
+            pr_number: PR_NUMBER,
+            branch: BRANCH,
+            commit_sha: COMMIT_SHA,
+            triggered_by: EVENT_NAME,
+            html_report_url: htmlReportUrl,
+            json_report_url: jsonReportUrl,
+          },
+          baseline: {
+            label: 'live',
+            url: LIVE_URL,
+            captured_at: baselineTimestamps[0] || null,
+          },
+          candidate: {
+            label: TARGET_ENV ? `multidev-${TARGET_ENV}` : 'candidate',
+            env: TARGET_ENV,
+            url: RC_URL,
+            captured_at: candidateTimestamps[0] || null,
+          },
+          config: {
+            threshold,
+            fail_on_diff: failOnDiff,
+            wait_seconds: defaultWait,
+            viewports: viewports.map(v => ({ name: v.name, width: v.width, height: v.height })),
+          },
+          summary: {
+            total_tests: results.length,
+            passed: summaryPassed,
+            failed: summaryFailed,
+            // new_baseline: current VRT captures both sides fresh every run, so
+            // there is no concept of a missing baseline. Kept at 0 for schema
+            // compatibility; may be populated by a future snapshot-based mode.
+            new_baseline: 0,
+            errored: erroredCount,
+            overall_status: overallStatus,
+            max_diff_ratio: parseFloat(maxDiffRatio.toFixed(6)),
+          },
+          tests: testsJson,
+        };
+
+        writeFileSync('report.json', JSON.stringify(report, null, 2));
+
+        console.log(`\nVRT complete: ${allPassed ? 'ALL PASSED ✅' : 'SOME FAILED ❌'}`);
+        VRTEOF
+
+    - name: Run VRT
+      id: run_vrt
+      if: steps.vrt_check.outputs.enabled == 'true'
+      env:
+        LIVE_URL:           ${{ steps.get_urls.outputs.live_url }}
+        RC_URL:             ${{ steps.get_urls.outputs.rc_url }}
+        TARGET_ENV:         ${{ inputs.target_env }}
+        PANTHEON_SITE:      ${{ inputs.pantheon_site }}
+        EXTRA_PAGES:        ${{ steps.vrt_check.outputs.extra_pages }}
+        GITHUB_RUN_ID:      ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        GITHUB_REPO:        ${{ github.repository }}
+        GITHUB_COMMIT_SHA:  ${{ github.event.pull_request.head.sha || github.sha }}
+        GITHUB_PR_NUMBER:   ${{ github.event.pull_request.number }}
+        GITHUB_BRANCH:      ${{ github.head_ref || github.ref_name }}
+        GITHUB_EVENT_NAME:  ${{ github.event_name }}
+        S3_BASE_URL:        ${{ steps.s3_urls.outputs.base_url }}
+      run: node vrt.mjs
+
+    - name: Upload screenshots and report to S3
+      id: s3_upload
+      if: steps.vrt_check.outputs.enabled == 'true' && steps.run_vrt.conclusion == 'success'
+      env:
+        AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_S3_BUCKET:         ${{ secrets.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT:   ${{ secrets.AWS_S3_REGION }}
+        PANTHEON_SITE:         ${{ inputs.pantheon_site }}
+      run: |
+        AWS_DEFAULT_REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
+        export AWS_DEFAULT_REGION
+
+        RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        S3_PREFIX="s3://${AWS_S3_BUCKET}/${PANTHEON_SITE}/${RUN_KEY}"
+        URL_BASE="https://${AWS_S3_BUCKET}.s3.${AWS_DEFAULT_REGION}.amazonaws.com/${PANTHEON_SITE}/${RUN_KEY}"
+
+        aws s3 cp screenshots/live/ "${S3_PREFIX}/live/" --recursive --quiet
+        aws s3 cp screenshots/rc/   "${S3_PREFIX}/rc/"   --recursive --quiet
+        aws s3 cp screenshots/diff/ "${S3_PREFIX}/diff/" --recursive --quiet
+        aws s3 cp report.html "${S3_PREFIX}/report.html" \
+          --content-type "text/html" \
+          --quiet
+        aws s3 cp report.json "${S3_PREFIX}/report.json" \
+          --content-type "application/json" \
+          --cache-control "public, max-age=31536000, immutable" \
+          --quiet
+
+        REPORT_URL="${URL_BASE}/report.html"
+        REPORT_JSON_URL="${URL_BASE}/report.json"
+        echo "report_url=${REPORT_URL}"           >> "$GITHUB_OUTPUT"
+        echo "report_json_url=${REPORT_JSON_URL}" >> "$GITHUB_OUTPUT"
+        echo "HTML report: ${REPORT_URL}"
+        echo "JSON report: ${REPORT_JSON_URL}"
+
+    - name: Comment on PR
+      if: steps.vrt_check.outputs.enabled == 'true' && steps.run_vrt.conclusion == 'success'
+      uses: actions/github-script@v8
+      env:
+        REPORT_URL:       ${{ steps.s3_upload.outputs.report_url }}
+        REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:       ${{ inputs.target_env }}
+        MULTIDEV_URL:     ${{ steps.get_urls.outputs.rc_url }}
+      with:
+        script: |
+          const fs            = require('fs');
+          const summary       = JSON.parse(fs.readFileSync('vrt-summary.json', 'utf8'));
+          const reportUrl     = process.env.REPORT_URL;
+          const reportJsonUrl = process.env.REPORT_JSON_URL;
+          const targetEnv     = process.env.TARGET_ENV;
+          const rcUrl         = process.env.MULTIDEV_URL;
+
+          const icon       = summary.allPassed ? '✅' : '❌';
+          const statusText = summary.allPassed ? 'All checks passed' : 'Some checks failed';
+
+          const tableRows = summary.results.map(r => {
+            const rowIcon = r.error ? '⚠️' : (r.passed ? '✅' : '❌');
+            const diff    = r.error ? 'Error' : `${r.diffPercent}%`;
+            return `| ${rowIcon} | ${r.page} | \`${r.path}\` | ${r.viewport} | ${diff} |`;
+          }).join('\n');
+
+          const body = [
+            `## ${icon} Visual Regression Test — ${statusText}`,
+            '',
+            `**${summary.passCount} passed, ${summary.failCount} failed** · Threshold: ${summary.thresholdPercent}%`,
+            '',
+            `| | Page | Path | Viewport | Diff |`,
+            `|:---:|---|---|---|---|`,
+            tableRows,
+            '',
+            `[📊 View Full Report with Screenshots](${reportUrl})`,
+            reportJsonUrl ? `[🤖 AI-readable JSON report](${reportJsonUrl})` : '',
+            '',
+            `> Multidev: \`${targetEnv}\` — ${rcUrl}`,
+          ].filter(Boolean).join('\n');
+
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body,
+          });
+
+    # Post VRT results to the ClickUp task identified from [vrt TASK-ID] or branch name.
+    # Skipped gracefully if CLICKUP_API_TOKEN / CLICKUP_TEAM_ID are not configured.
+    - name: Comment on ClickUp task
+      if: >
+        steps.vrt_check.outputs.enabled == 'true' &&
+        steps.run_vrt.conclusion == 'success' &&
+        steps.vrt_check.outputs.clickup_task_id != ''
+      continue-on-error: true
+      env:
+        CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        CLICKUP_TEAM_ID:   ${{ secrets.CLICKUP_TEAM_ID }}
+        TASK_ID:           ${{ steps.vrt_check.outputs.clickup_task_id }}
+        REPORT_URL:        ${{ steps.s3_upload.outputs.report_url }}
+        REPORT_JSON_URL:   ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:        ${{ inputs.target_env }}
+        MULTIDEV_URL:      ${{ steps.get_urls.outputs.rc_url }}
+      run: |
+        if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
+          echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set — skipping ClickUp comment"
+          exit 0
+        fi
+
+        COMMENT_TEXT=$(node -e "
+          const s = JSON.parse(require('fs').readFileSync('vrt-summary.json'));
+          const icon = s.allPassed ? '✅' : '❌';
+          const rows = s.results.map(r => {
+            const i    = r.error ? '⚠️' : (r.passed ? '✅' : '❌');
+            const diff = r.error ? 'Error' : r.diffPercent + '%';
+            return \`\${i} \${r.page} (\${r.viewport}): \${diff}\`;
+          }).join('\n');
+          const lines = [
+            \`\${icon} Visual Regression Test — \${s.passCount} passed, \${s.failCount} failed (threshold \${s.thresholdPercent}%)\`,
+            '',
+            rows,
+            '',
+            \`Environment : \${process.env.TARGET_ENV}\`,
+            \`Multidev URL: \${process.env.MULTIDEV_URL}\`,
+            \`Report      : \${process.env.REPORT_URL}\`,
+          ];
+          if (process.env.REPORT_JSON_URL) {
+            lines.push(\`JSON report : \${process.env.REPORT_JSON_URL}\`);
+          }
+          lines.push(
+            '',
+            '---',
+            'VRT interpretation note:',
+            'Visual Regression Test results are data points, not automatic pass or fail decisions. Content-driven differences such as dates, events, stories, and feed updates are often expected.',
+            'Reviewers should prioritize unintended structural or styling regressions, layout shifts, accessibility-impacting changes, and interaction breakage.',
+          );
+          console.log(lines.join('\n'));
+        ")
+
+        RESPONSE=$(curl -s -o /tmp/cu_vrt_response.json -w "%{http_code}" -X POST \
+          "https://api.clickup.com/api/v2/task/${TASK_ID}/comment?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}" \
+          -H "Authorization: ${CLICKUP_API_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg text "$COMMENT_TEXT" '{"comment_text": $text}')")
+
+        echo "ClickUp API response: ${RESPONSE}"
+        cat /tmp/cu_vrt_response.json || true
+        if [[ "$RESPONSE" != "200" ]]; then
+          echo "Warning: ClickUp comment may not have posted (HTTP ${RESPONSE})"
+        fi
+
+    # Fail the job here (after comments are already posted) if fail_on_diff is
+    # enabled in vrt-config.yml and differences exceeded the threshold.
+    - name: Assert VRT results
+      if: steps.vrt_check.outputs.enabled == 'true' && steps.run_vrt.conclusion == 'success'
+      run: |
+        SHOULD_FAIL=$(node -e "
+          const s = JSON.parse(require('fs').readFileSync('vrt-summary.json'));
+          console.log(!s.allPassed && s.failOnDiff ? 'true' : 'false');
+        ")
+        if [[ "$SHOULD_FAIL" == "true" ]]; then
+          echo "❌ Visual differences exceeded threshold and fail_on_diff is enabled in vrt-config.yml"
+          exit 1
+        fi
+        echo "✅ VRT assertion passed"
+
+    # Runs after assert (even on failure) so fail_on_diff jobs still notify.
+    - name: Notify Slack
+      if: >
+        always() &&
+        steps.vrt_check.outputs.enabled == 'true' &&
+        steps.run_vrt.conclusion == 'success' &&
+        inputs.slack_channel != ''
+      env:
+        SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+        SLACK_CHANNEL:    ${{ inputs.slack_channel }}
+        REPORT_URL:       ${{ steps.s3_upload.outputs.report_url }}
+        REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:       ${{ inputs.target_env }}
+        PANTHEON_SITE:    ${{ inputs.pantheon_site }}
+      run: |
+        if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+          echo "SLACK_BOT_TOKEN not set — skipping Slack notification"
+          exit 0
+        fi
+
+        ALL_PASSED=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.allPassed)")
+        PASS_COUNT=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.passCount)")
+        FAIL_COUNT=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.failCount)")
+        THRESHOLD=$(node  -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.thresholdPercent)")
+
+        if [[ "$ALL_PASSED" == "true" ]]; then
+          STATUS_EMOJI=":white_check_mark:"
+          STATUS_COLOR="good"
+          STATUS_TEXT="All checks passed"
+        else
+          STATUS_EMOJI=":x:"
+          STATUS_COLOR="danger"
+          STATUS_TEXT="Some checks failed"
+        fi
+
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        REPO="${{ github.repository }}"
+        PR_FIELD=""
+        if [[ -n "$PR_NUMBER" ]]; then
+          PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": true}"
+        fi
+
+        REPORT_FIELD=""
+        if [[ -n "$REPORT_URL" ]]; then
+          REPORT_FIELD=",{\"title\": \"Report\", \"value\": \"<${REPORT_URL}|View Full Report>\", \"short\": false}"
+        fi
+
+        REPORT_JSON_FIELD=""
+        if [[ -n "$REPORT_JSON_URL" ]]; then
+          REPORT_JSON_FIELD=",{\"title\": \"AI-readable JSON\", \"value\": \"<${REPORT_JSON_URL}|report.json>\", \"short\": false}"
+        fi
+
+        # Always-on interpretation note so reviewers don't treat every diff as a regression.
+        NOTE_FIELD=",{\"title\": \"VRT interpretation note\", \"value\": \"Visual Regression Test results are data points, not automatic pass or fail decisions. Content-driven differences such as dates, events, stories, and feed updates are often expected.\\n\\nReviewers should prioritize unintended structural or styling regressions, layout shifts, accessibility-impacting changes, and interaction breakage.\", \"short\": false}"
+
+        curl -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+          -H 'Content-type: application/json; charset=utf-8' \
+          --data "{
+            \"channel\": \"${SLACK_CHANNEL}\",
+            \"text\": \"${STATUS_EMOJI} Visual Regression Test — ${STATUS_TEXT}\",
+            \"attachments\": [{
+              \"color\": \"${STATUS_COLOR}\",
+              \"fields\": [
+                {\"title\": \"Site\",        \"value\": \"${PANTHEON_SITE}\", \"short\": true},
+                {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\",    \"short\": true},
+                {\"title\": \"Results\",     \"value\": \"${PASS_COUNT} passed, ${FAIL_COUNT} failed (threshold ${THRESHOLD}%)\", \"short\": false}
+                ${PR_FIELD}
+                ${REPORT_FIELD}
+                ${REPORT_JSON_FIELD}
+                ${NOTE_FIELD}
+              ],
+              \"footer\": \"GitHub Actions\",
+              \"ts\": $(date +%s)
+            }]
+          }" \
+          https://slack.com/api/chat.postMessage
