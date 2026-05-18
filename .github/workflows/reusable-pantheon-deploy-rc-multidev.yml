@@ -81,7 +81,7 @@ jobs:
           echo "Derived RC multidev name: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: ./.github/actions/terminus-install
+        uses: Square360/shared-workflows/.github/actions/terminus-install@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
         with:
           machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
 
@@ -104,7 +104,7 @@ jobs:
 
       - name: Push code to Pantheon multidev
         id: deploy
-        uses: ./.github/actions/pantheon-push
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -115,7 +115,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: ./.github/actions/pantheon-post-deploy-drush
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -158,7 +158,7 @@ jobs:
     needs: deploy_rc_multidev
     # The security workflow detects rc-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding). No force_run needed.
-    uses: ./.github/workflows/reusable-pantheon-security-scan.yml
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@2a2d8286dc3901ea13a759379a99a399d5151b60  # v3.0.0
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
