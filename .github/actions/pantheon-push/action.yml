@@ -73,3 +73,9 @@ runs:
         git_commit_message: ${{ inputs.commit_message }}
         delete_old_environments: false
         clone_content: false
+        # We build on GitHub and push to Pantheon, so we don't need the Build
+        # Tools plugin's create-on-Pantheon flow. The direct-git path is
+        # idempotent: it checks multidev existence before calling
+        # multidev:create, so re-pushes to an existing rc-/epr-/pr- multidev
+        # update the code instead of failing with "environment already exists".
+        skip_build_tools: true
