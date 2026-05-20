@@ -63,7 +63,7 @@ jobs:
   semantic_release:
     name: Semantic Release
     if: ${{ inputs.run_semantic_release }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@v3.0.2
+    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@v3.1.0
     secrets:
       CI_GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
 
@@ -93,7 +93,7 @@ jobs:
           fetch-depth: 1
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.1.0
         with:
           machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
 
@@ -103,7 +103,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Push code to Pantheon DEV
         id: deploy_pantheon
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.1.0
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: dev
@@ -160,7 +160,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.1.0
         with:
           site: ${{ inputs.pantheon_site }}
           env: dev

@@ -2,6 +2,36 @@
 
 This file tracks the work done together with GitHub Copilot on the Square360 Shared Pantheon Workflows repository.
 
+## 2026-05-20
+
+### Feature - VRT opt-in on RC multidev (v3.1.0)
+
+- **Added `visual_regression` job to `reusable-pantheon-deploy-rc-multidev.yml`**
+  - Mirrors the PR-multidev VRT job: opt-in, post-deploy, runs against the just-built RC multidev
+  - Gate: `contains(github.event.head_commit.message, '[run-vrt]') || contains(..., '[vrt]')` — the push-event equivalent of the PR-multidev's PR-body flag, since RC deploys are triggered by merge-to-`develop` and have no PR body
+  - Calls `reusable-pantheon-vrt.yml` with `force_run: true` so VRT skips its own (PR-body-based) gate after we've already gated on commit message
+  - Explicit secrets forwarding: `PANTHEON_MACHINE_TOKEN`, `AWS_*`, `CLICKUP_*`, `SLACK_BOT_TOKEN` — matches the cross-org pattern documented on the `security_scan` job
+  - Header comment updated to document the new opt-in
+  - Added `CLICKUP_API_TOKEN` and `CLICKUP_TEAM_ID` to the workflow's `secrets:` block (both optional) so the VRT job can post ClickUp comments when a task ID is present in the commit or branch
+
+### Maintenance - Self-reference bumps to v3.1.0
+
+- **Bumped all in-repo `uses:` self-references from `@v3.0.2` to `@v3.1.0`** across:
+  - `reusable-pantheon-deploy-rc-multidev.yml`
+  - `reusable-pantheon-deploy-pr-multidev.yml`
+  - `reusable-pantheon-deploy-epic-multidev.yml`
+  - `reusable-pantheon-deploy-dev.yml`
+- Affects: `terminus-install`, `pantheon-push`, `pantheon-post-deploy-drush`, `reusable-pantheon-security-scan.yml`, `reusable-pantheon-vrt.yml`, `reusable-semantic-release.yml`
+- These pins were stuck at `@v3.0.2` through hotfixes v3.0.3 / v3.0.4 / v3.0.5, so v3.1.0 also lifts the internal pins forward to current
+- The IDE flags these as "Unable to resolve" until the v3.1.0 tag exists — expected; semantic-release tags on merge to `main` and the diagnostics resolve themselves
+
+### Release sequence (informational)
+
+1. Merge this branch to `main` → semantic-release tags `v3.1.0`, generates root `CHANGELOG.md`, publishes GitHub release
+2. Capture the v3.1.0 commit SHA from the new tag
+3. Update `pantheon-github-workflows` template SHAs to point at the new tag (see that repo's CHANGELOG entry)
+4. Merge the plugin PR → its own semantic-release tags a new plugin version (minor — new VRT capability surfaced to consumers)
+
 ## 2025-10-23
 
 ### Added

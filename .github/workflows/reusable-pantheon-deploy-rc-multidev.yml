@@ -11,7 +11,9 @@ name: Reusable Deploy to RC Multidev (Pantheon)
 #   - ClickUp comment: skipped (rc-multidev triggers are push events, no PR
 #                      context to extract a task ID from)
 #   - Security scan: MANDATORY (force_run=true). The release-candidate gate.
-#   - VRT: not bundled. VRT remains a PR-time opt-in.
+#   - VRT: opt-in via [run-vrt] (or legacy [vrt]) in the merge commit message
+#          on develop. Mirrors the PR multidev's PR-body flag — since RC is
+#          triggered by a push, the commit message is the equivalent channel.
 #
 # No skip-multidev / docs-only gating here — those are PR-body flags. A push
 # to develop is the post-merge state; the developer can't opt out at this point.
@@ -48,6 +50,10 @@ on:
         required: false
       AWS_S3_REGION:
         required: false
+      CLICKUP_API_TOKEN:
+        required: false
+      CLICKUP_TEAM_ID:
+        required: false
 
 defaults:
   run:
@@ -82,7 +88,7 @@ jobs:
           echo "Derived RC multidev name: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.1.0
         with:
           machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
 
@@ -105,7 +111,7 @@ jobs:
 
       - name: Push code to Pantheon multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.1.0
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -116,7 +122,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.0.2
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.1.0
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -159,7 +165,7 @@ jobs:
     needs: deploy_rc_multidev
     # The security workflow detects rc-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding). No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.0.2
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.1.0
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
@@ -174,6 +180,37 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
       AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  visual_regression:
+    name: Visual Regression (opt-in)
+    needs: deploy_rc_multidev
+    # Opt-in via [run-vrt] (or legacy [vrt]) in the merge commit message.
+    # No PR body exists on a push-to-develop trigger, so the commit message
+    # is the equivalent channel to the PR multidev's PR-body flag.
+    if: >-
+      ${{
+        contains(github.event.head_commit.message, '[run-vrt]') ||
+        contains(github.event.head_commit.message, '[vrt]')
+      }}
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v3.1.0
+    with:
+      pantheon_site: ${{ inputs.pantheon_site }}
+      target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
+      slack_channel: ${{ inputs.slack_channel }}
+      # VRT's internal gate parses [run-vrt] from the PR body — which is empty
+      # on push events. We've already gated this job on the commit message
+      # above, so tell VRT to skip its own check and just run.
+      force_run: true
+    # See note above the security_scan job's secrets block — same constraint.
+    secrets:
+      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
+      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+      CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   notify_slack:
