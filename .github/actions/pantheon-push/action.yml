@@ -58,6 +58,25 @@ runs:
       shell: bash
       run: composer install --no-dev --optimize-autoloader --no-interaction
 
+    # We build on Actions and push the full artifact to Pantheon (no Build
+    # Tools, no integrated Composer on Pantheon). Source-repo .gitignore
+    # excludes vendor/, web/core/, contrib dirs, scaffolded files — exactly
+    # the files Pantheon needs. Upstream push-to-pantheon's direct-git path
+    # does `git push HEAD` (scripts/main.sh:398), so the artifact has to be
+    # staged before that runs. Upstream main.sh:387 will commit the staged
+    # changes for us before pushing.
+    - name: Stage Composer build artifact for Pantheon push
+      shell: bash
+      run: |
+        git add -A --force
+        STAGED_COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
+        echo "Staged ${STAGED_COUNT} paths for push to Pantheon"
+        echo "Sample (first 20):"
+        git diff --cached --name-only | head -20
+        if [ "${STAGED_COUNT}" -gt 20 ]; then
+          echo "  ... ($((STAGED_COUNT - 20)) more)"
+        fi
+
     - name: Push to Pantheon
       uses: pantheon-systems/push-to-pantheon@0.9.0
       env:
