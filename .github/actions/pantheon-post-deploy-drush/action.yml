@@ -23,6 +23,35 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # After git-pushing a fresh build artifact to Pantheon, the new vendor/
+    # tree takes a few seconds to propagate to the env's application
+    # filesystem. If drush runs too early it bootstraps with a partial
+    # vendor/ and then dies during shutdown when lazy-loading post-command
+    # hook classes that aren't on disk yet (e.g. ProcessResultHookDispatcher,
+    # ConsoleErrorEvent, symfony/http-foundation/Response). Poll a quick
+    # drush no-op until it exits cleanly before proceeding to updb/cim.
+    - name: Wait for Pantheon env filesystem to settle after code push
+      if: ${{ inputs.skip != 'true' }}
+      shell: bash
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ inputs.machine_token }}
+        SITE: ${{ inputs.site }}
+        ENV: ${{ inputs.env }}
+      run: |
+        echo "Waiting for ${SITE}.${ENV} to settle after code push..."
+        MAX_ATTEMPTS=45
+        for i in $(seq 1 ${MAX_ATTEMPTS}); do
+          if terminus -n drush "${SITE}.${ENV}" -- core:status --format=string >/dev/null 2>&1; then
+            echo "✅ ${SITE}.${ENV} drush is ready (attempt ${i})"
+            break
+          fi
+          if [ "$i" -eq "${MAX_ATTEMPTS}" ]; then
+            echo "::warning::Timed out after ${MAX_ATTEMPTS} attempts (~90s) waiting for drush bootstrap on ${SITE}.${ENV}; proceeding anyway"
+            break
+          fi
+          sleep 2
+        done
+
     - name: Run config imports and db updates
       if: ${{ inputs.skip != 'true' }}
       shell: bash
