@@ -88,7 +88,7 @@ jobs:
           echo "Derived RC multidev name: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.1.5
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.1.6
         with:
           machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
 
@@ -111,7 +111,7 @@ jobs:
 
       - name: Push code to Pantheon multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.1.5
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.1.6
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -122,7 +122,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.1.5
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.1.6
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -165,7 +165,7 @@ jobs:
     needs: deploy_rc_multidev
     # The security workflow detects rc-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding). No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.1.5
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.1.6
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
@@ -193,7 +193,7 @@ jobs:
         contains(github.event.head_commit.message, '[run-vrt]') ||
         contains(github.event.head_commit.message, '[vrt]')
       }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v3.1.5
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v3.1.6
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}

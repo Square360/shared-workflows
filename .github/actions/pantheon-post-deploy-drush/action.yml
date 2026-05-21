@@ -71,14 +71,41 @@ runs:
           UPDB_FLAGS="-y -v"
         fi
 
+        # Even after the Drupal-bootstrap wait passes, individual drush
+        # commands can still hit transient include() failures when their
+        # specific lazy-loaded classes haven't synced to the appserver
+        # container yet (symfony/console error events, http-foundation
+        # Response, etc.). cim in particular hits this — its post-prompt
+        # code path lazy-loads classes that updb doesn't touch. One retry
+        # with a 30s backoff covers nearly all of these. Drush commands
+        # here (updb, cim, env:clear-cache) are idempotent so retrying is
+        # safe even if attempt 1 partially succeeded.
+        retry_drush() {
+          local cmd_desc="$1"
+          shift
+          local max_attempts=2
+          for i in $(seq 1 $max_attempts); do
+            if "$@"; then
+              [ "$i" -gt 1 ] && echo "✅ ${cmd_desc} succeeded on attempt ${i}"
+              return 0
+            fi
+            if [ "$i" -lt "$max_attempts" ]; then
+              echo "::warning::${cmd_desc} failed on attempt ${i}; waiting 30s before retry..."
+              sleep 30
+            fi
+          done
+          echo "::error::${cmd_desc} failed after ${max_attempts} attempts"
+          return 1
+        }
+
         if [[ "$PR_TITLE" == *"[config-first]"* ]]; then
           echo "🔧 Running config import first (detected [config-first] tag)"
-          terminus -n drush "${SITE}.${ENV}" -- cim -y
-          terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
+          retry_drush "drush cim" terminus -n drush "${SITE}.${ENV}" -- cim -y
+          retry_drush "drush updb" terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
         else
           echo "🔧 Running database update first (default order)"
-          terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
-          terminus -n drush "${SITE}.${ENV}" -- cim -y
+          retry_drush "drush updb" terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
+          retry_drush "drush cim" terminus -n drush "${SITE}.${ENV}" -- cim -y
         fi
 
-        terminus -n env:clear-cache "${SITE}.${ENV}"
+        retry_drush "env:clear-cache" terminus -n env:clear-cache "${SITE}.${ENV}"
