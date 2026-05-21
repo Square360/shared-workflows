@@ -1,5 +1,5 @@
 name: 'Pantheon post-deploy Drush commands'
-description: 'Runs database updates (updb), config import (cim), and cache rebuild via Terminus drush on a Pantheon environment. Honors [config-first] (run cim before updb) and [verbose] (verbose updb) PR-title flags. Requires Terminus to already be installed and authenticated.'
+description: 'Runs `drush deploy` (updatedb → cache:rebuild → config:import → cache:rebuild → deploy:hook) plus a Pantheon edge cache flush on a Pantheon environment. Honors [verbose] PR-title flag for -v on drush deploy. Requires Terminus to already be installed and authenticated.'
 
 inputs:
   site:
@@ -16,7 +16,7 @@ inputs:
     required: false
     default: 'false'
   pr_title:
-    description: 'PR title (for [config-first] and [verbose] flag detection). Leave empty for non-PR triggers — flags will not match and default ordering applies.'
+    description: 'PR title (for [verbose] flag detection). Leave empty for non-PR triggers — the flag will not match and default flags apply.'
     required: false
     default: ''
 
@@ -56,7 +56,7 @@ runs:
           sleep 2
         done
 
-    - name: Run config imports and db updates
+    - name: Run drush deploy
       if: ${{ inputs.skip != 'true' }}
       shell: bash
       env:
@@ -65,21 +65,28 @@ runs:
         SITE: ${{ inputs.site }}
         ENV: ${{ inputs.env }}
       run: |
-        UPDB_FLAGS="-y"
+        # `drush deploy` runs the canonical sequence:
+        #   1. updatedb --no-cache-clear   (hook_update_N)
+        #   2. cache:rebuild               (container sees updb's schema/state)
+        #   3. config:import               (new config imports against fresh container)
+        #   4. cache:rebuild               (next request sees imported config)
+        #   5. deploy:hook                 (hook_deploy_NAME — data work that needs new config)
+        # Data migrations that depend on imported config belong in MODULE.deploy.php
+        # (hook_deploy_NAME), not hook_update_N. See Drush docs: drush.org/deploycommand
+        DEPLOY_FLAGS="-y"
         if [[ "$PR_TITLE" == *"[verbose]"* ]]; then
-          echo "🔍 Verbose updb enabled (detected [verbose] tag)"
-          UPDB_FLAGS="-y -v"
+          echo "🔍 Verbose deploy enabled (detected [verbose] tag)"
+          DEPLOY_FLAGS="-y -v"
         fi
 
-        # Even after the Drupal-bootstrap wait passes, individual drush
-        # commands can still hit transient include() failures when their
-        # specific lazy-loaded classes haven't synced to the appserver
-        # container yet (symfony/console error events, http-foundation
-        # Response, etc.). cim in particular hits this — its post-prompt
-        # code path lazy-loads classes that updb doesn't touch. One retry
-        # with a 30s backoff covers nearly all of these. Drush commands
-        # here (updb, cim, env:clear-cache) are idempotent so retrying is
-        # safe even if attempt 1 partially succeeded.
+        # Even after the Drupal-bootstrap wait passes, drush can still hit
+        # transient include() failures when lazy-loaded classes haven't
+        # synced to the appserver container yet (symfony/console error
+        # events, http-foundation Response, etc.). One retry with a 30s
+        # backoff covers nearly all of these. `drush deploy` and
+        # `env:clear-cache` are both idempotent so retrying is safe even
+        # if attempt 1 partially succeeded — drush deploy's sub-commands
+        # (updb, cim, cr, deploy:hook) are each individually idempotent.
         retry_drush() {
           local cmd_desc="$1"
           shift
@@ -98,14 +105,10 @@ runs:
           return 1
         }
 
-        if [[ "$PR_TITLE" == *"[config-first]"* ]]; then
-          echo "🔧 Running config import first (detected [config-first] tag)"
-          retry_drush "drush cim" terminus -n drush "${SITE}.${ENV}" -- cim -y
-          retry_drush "drush updb" terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
-        else
-          echo "🔧 Running database update first (default order)"
-          retry_drush "drush updb" terminus -n drush "${SITE}.${ENV}" -- updb $UPDB_FLAGS
-          retry_drush "drush cim" terminus -n drush "${SITE}.${ENV}" -- cim -y
-        fi
+        echo "🚀 Running drush deploy (updb → cr → cim → cr → deploy:hook)"
+        retry_drush "drush deploy" terminus -n drush "${SITE}.${ENV}" -- deploy $DEPLOY_FLAGS
 
+        # drush deploy's internal cache:rebuild clears Drupal's container
+        # cache but not Pantheon's edge/CDN cache. Flush it so users see
+        # the deployed code on the next request.
         retry_drush "env:clear-cache" terminus -n env:clear-cache "${SITE}.${ENV}"

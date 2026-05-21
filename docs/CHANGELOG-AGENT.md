@@ -2,6 +2,53 @@
 
 This file tracks the work done together with GitHub Copilot on the Square360 Shared Pantheon Workflows repository.
 
+## 2026-05-21
+
+### Feature - `pantheon-post-deploy-drush` switches to `drush deploy` (v3.2.0)
+
+- **Replaced separate `updb` / `cim` / `env:clear-cache` sequence with `drush deploy`** in `.github/actions/pantheon-post-deploy-drush/action.yml`
+  - New canonical sequence (run inside one `terminus drush <site>.<env> -- deploy`):
+    1. `updatedb --no-cache-clear` (runs `hook_update_N`)
+    2. `cache:rebuild` — container sees updb's schema/state before cim
+    3. `config:import`
+    4. `cache:rebuild` — next request sees imported config
+    5. `deploy:hook` — runs `hook_deploy_NAME` (data work that depends on imported config)
+  - Then `terminus env:clear-cache` flushes Pantheon's edge/CDN cache (drush's internal cache:rebuild doesn't reach the edge)
+- **Why:**
+  - The previous flow ran `updb` then `cim` (or `cim` then `updb` with `[config-first]`) with no cache rebuild between them. Stale container state between the two could cause cim to misbehave — the workaround was the `[config-first]` PR-title flag. `drush deploy` fixes the underlying problem by rebuilding cache between updb and cim.
+  - Adds support for `hook_deploy_NAME()` (post-config-import data migrations). Consumers writing field-to-field data migrations should now put them in `MODULE.deploy.php` rather than working around with `[config-first]` + `hook_update_N`.
+
+### Breaking - `[config-first]` PR-title flag removed
+
+- The `[config-first]` PR-title flag no longer does anything. The behavior it forced (cim before updb) is no longer needed — `drush deploy`'s built-in cache rebuild between updb and cim is the canonical fix.
+- Consumer impact: PRs that included `[config-first]` continue to deploy, the tag is just ignored. Most existing update hooks that needed `[config-first]` will now work correctly under default ordering. The few that genuinely needed cim-first should migrate their data work to `hook_deploy_NAME()`.
+- `[verbose]` PR-title flag is preserved (now passes `-v` to `drush deploy` instead of just `updb`).
+
+### Maintenance - Self-reference bumps to v3.2.0
+
+- **Bumped all in-repo `uses:` self-references from `@v3.1.6` to `@v3.2.0`** (18 refs) across:
+  - `reusable-pantheon-deploy-dev.yml`
+  - `reusable-pantheon-deploy-pr-multidev.yml`
+  - `reusable-pantheon-deploy-rc-multidev.yml`
+  - `reusable-pantheon-deploy-epic-multidev.yml`
+- Affects: `terminus-install`, `pantheon-push`, `pantheon-post-deploy-drush`, `reusable-semantic-release.yml`, `reusable-pantheon-security-scan.yml`, `reusable-pantheon-vrt.yml`
+- IDE flags these as "Unable to resolve" until the v3.2.0 tag exists — expected; semantic-release tags on merge to `main` and the diagnostics resolve themselves.
+
+### Maintenance - Strip `[config-first]` from header comments
+
+- Updated header/inline comments in `reusable-pantheon-deploy-dev.yml`, `reusable-pantheon-deploy-rc-multidev.yml`, `reusable-pantheon-deploy-epic-multidev.yml` to remove references to the now-removed `[config-first]` flag. `[verbose]` documentation retained.
+
+### Out of scope (informational)
+
+- `.github/workflows/reusable-deploy-pantheon.yml` and `.github/workflows/reusable-deploy-multidev.yml` (the older monolithic workflows still pointed to from `README.md` via `@main`) keep their existing inline `updb` / `cim` / `cr` logic. These workflows are deprecated and scheduled for removal in v4.0.0; not worth backporting drush deploy to them now.
+
+### Release sequence (informational)
+
+1. Merge this branch to `main` → semantic-release tags `v3.2.0`, generates root `CHANGELOG.md`, publishes GitHub release
+2. Capture the v3.2.0 commit SHA from the new tag
+3. Update `pantheon-github-workflows` template SHAs to point at the new tag (see that repo's CHANGELOG entry)
+4. Trigger a Satis rebuild so the new release is visible to `composer update` on consumer sites
+
 ## 2026-05-20
 
 ### Feature - VRT opt-in on RC multidev (v3.1.0)
