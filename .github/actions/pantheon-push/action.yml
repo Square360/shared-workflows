@@ -63,10 +63,24 @@ runs:
     # excludes vendor/, web/core/, contrib dirs, scaffolded files — exactly
     # the files Pantheon needs. Upstream push-to-pantheon's direct-git path
     # does `git push HEAD` (scripts/main.sh:398), so the artifact has to be
-    # staged before that runs. Upstream main.sh:387 will commit the staged
-    # changes for us before pushing.
-    - name: Stage Composer build artifact for Pantheon push
+    # committed before that runs.
+    #
+    # We commit it ourselves with --quiet so upstream's own commit step
+    # (main.sh:387, gated on `! git diff --cached --quiet`) is a no-op.
+    # That suppresses ~46k lines of `create mode 100644 …` diff summary
+    # per deploy — the full file list is still on the commit object and
+    # inspectable via `git show --stat HEAD` against the Pantheon repo.
+    - name: Stage and commit Composer build artifact for Pantheon push
       shell: bash
+      env:
+        # Match the values passed to upstream's push-to-pantheon step below
+        # so the commit author is the same whether we commit here or upstream
+        # commits later. Set them inline on `git commit` (via -c) rather than
+        # globally — upstream's "Configure Git User" step runs after this
+        # action, and we don't want to fight it over global config.
+        DEPLOY_GIT_USER_NAME: ${{ github.event.pull_request.user.login || github.actor }}
+        DEPLOY_GIT_USER_EMAIL: ${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.actor) }}
+        DEPLOY_COMMIT_MESSAGE: ${{ inputs.commit_message }}
       run: |
         git add -A --force
         # Buffer the path list to disk: piping `git diff --name-only` directly
@@ -82,6 +96,15 @@ runs:
           echo "  ... ($((STAGED_COUNT - 20)) more)"
         fi
         rm -f "${STAGED_LIST}"
+
+        if ! git diff --cached --quiet; then
+          git -c user.name="${DEPLOY_GIT_USER_NAME}" \
+              -c user.email="${DEPLOY_GIT_USER_EMAIL}" \
+              commit -q -m "${DEPLOY_COMMIT_MESSAGE}"
+          echo "Committed artifact (quiet). Upstream push step will push HEAD to Pantheon."
+        else
+          echo "Nothing staged after composer install; skipping pre-commit (upstream push will no-op the commit too)."
+        fi
 
     - name: Push to Pantheon
       uses: pantheon-systems/push-to-pantheon@0.9.0
