@@ -24,12 +24,16 @@ runs:
   using: 'composite'
   steps:
     # After git-pushing a fresh build artifact to Pantheon, the new vendor/
-    # tree takes a few seconds to propagate to the env's application
-    # filesystem. If drush runs too early it bootstraps with a partial
-    # vendor/ and then dies during shutdown when lazy-loading post-command
-    # hook classes that aren't on disk yet (e.g. ProcessResultHookDispatcher,
-    # ConsoleErrorEvent, symfony/http-foundation/Response). Poll a quick
-    # drush no-op until it exits cleanly before proceeding to updb/cim.
+    # and web/core/ trees take seconds-to-minutes to propagate to the env's
+    # application container filesystem. If drush runs too early it bootstraps
+    # against a partial tree and dies — either during shutdown (lazy-loaded
+    # hook classes missing) or during the command itself (Drupal Kernel
+    # init can't find web/core/lib/Drupal/Core/Render/HtmlResponse.php etc.).
+    #
+    # Probe with `drush ev '\Drupal::VERSION'` — it exercises the full Drupal
+    # bootstrap path (Kernel + autoload + core includes), same as updb/cim.
+    # Lighter probes like `core:status` can pass while web/core/* is still
+    # syncing, especially on freshly-created multidevs (PR/RC/epic).
     - name: Wait for Pantheon env filesystem to settle after code push
       if: ${{ inputs.skip != 'true' }}
       shell: bash
@@ -38,15 +42,15 @@ runs:
         SITE: ${{ inputs.site }}
         ENV: ${{ inputs.env }}
       run: |
-        echo "Waiting for ${SITE}.${ENV} to settle after code push..."
-        MAX_ATTEMPTS=45
+        echo "Waiting for ${SITE}.${ENV} to settle after code push (full Drupal bootstrap probe)..."
+        MAX_ATTEMPTS=90
         for i in $(seq 1 ${MAX_ATTEMPTS}); do
-          if terminus -n drush "${SITE}.${ENV}" -- core:status --format=string >/dev/null 2>&1; then
-            echo "✅ ${SITE}.${ENV} drush is ready (attempt ${i})"
+          if terminus -n drush "${SITE}.${ENV}" -- ev 'echo \Drupal::VERSION;' >/dev/null 2>&1; then
+            echo "✅ ${SITE}.${ENV} drush+Drupal bootstrap is ready (attempt ${i})"
             break
           fi
           if [ "$i" -eq "${MAX_ATTEMPTS}" ]; then
-            echo "::warning::Timed out after ${MAX_ATTEMPTS} attempts (~90s) waiting for drush bootstrap on ${SITE}.${ENV}; proceeding anyway"
+            echo "::warning::Timed out after ${MAX_ATTEMPTS} attempts (~3min) waiting for Drupal bootstrap on ${SITE}.${ENV}; proceeding anyway"
             break
           fi
           sleep 2
