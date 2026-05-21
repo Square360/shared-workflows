@@ -80,25 +80,31 @@ runs:
         fi
 
         # Even after the Drupal-bootstrap wait passes, drush can still hit
-        # transient include() failures when lazy-loaded classes haven't
-        # synced to the appserver container yet (symfony/console error
-        # events, http-foundation Response, etc.). One retry with a 30s
-        # backoff covers nearly all of these. `drush deploy` and
-        # `env:clear-cache` are both idempotent so retrying is safe even
-        # if attempt 1 partially succeeded — drush deploy's sub-commands
-        # (updb, cim, cr, deploy:hook) are each individually idempotent.
+        # transient failures while the appserver finishes settling: lazy-
+        # loaded classes not yet synced (symfony/console ConsoleErrorEvent,
+        # http-foundation Response, etc.), or PhpStorage mkdir() Permission
+        # Denied during cache:rebuild as the writable mounts come online.
+        # Heavy PRs (Drupal/Symfony security updates) widen this window and
+        # can outlast a single short retry, so we use progressive backoff:
+        # 30s → 60s → 180s (4 attempts, ~4.5min worst-case wait). `drush
+        # deploy` and `env:clear-cache` are both idempotent so retrying is
+        # safe even if an attempt partially succeeded — drush deploy's
+        # sub-commands (updb, cr, cim, deploy:hook) are each individually
+        # idempotent.
         retry_drush() {
           local cmd_desc="$1"
           shift
-          local max_attempts=2
+          local backoffs=(30 60 180)
+          local max_attempts=$((${#backoffs[@]} + 1))
           for i in $(seq 1 $max_attempts); do
             if "$@"; then
               [ "$i" -gt 1 ] && echo "✅ ${cmd_desc} succeeded on attempt ${i}"
               return 0
             fi
             if [ "$i" -lt "$max_attempts" ]; then
-              echo "::warning::${cmd_desc} failed on attempt ${i}; waiting 30s before retry..."
-              sleep 30
+              local wait="${backoffs[$((i-1))]}"
+              echo "::warning::${cmd_desc} failed on attempt ${i}; waiting ${wait}s before retry..."
+              sleep "$wait"
             fi
           done
           echo "::error::${cmd_desc} failed after ${max_attempts} attempts"
