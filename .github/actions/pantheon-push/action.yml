@@ -69,13 +69,19 @@ runs:
       shell: bash
       run: |
         git add -A --force
-        STAGED_COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
+        # Buffer the path list to disk: piping `git diff --name-only` directly
+        # into `head -20` causes git to SIGPIPE on the 21st write, which under
+        # `set -e -o pipefail` fails the whole step (v3.1.2 regression).
+        STAGED_LIST=$(mktemp)
+        git diff --cached --name-only > "${STAGED_LIST}"
+        STAGED_COUNT=$(wc -l < "${STAGED_LIST}" | tr -d ' ')
         echo "Staged ${STAGED_COUNT} paths for push to Pantheon"
         echo "Sample (first 20):"
-        git diff --cached --name-only | head -20
+        head -20 "${STAGED_LIST}"
         if [ "${STAGED_COUNT}" -gt 20 ]; then
           echo "  ... ($((STAGED_COUNT - 20)) more)"
         fi
+        rm -f "${STAGED_LIST}"
 
     - name: Push to Pantheon
       uses: pantheon-systems/push-to-pantheon@0.9.0
