@@ -88,8 +88,13 @@ jobs:
           # github.ref is correct on push triggers; pull_request.base.ref is
           # the safety net if this workflow is wired up via PR events.
           ref: ${{ github.event.pull_request.base.ref || github.ref }}
-          # Shallow clone — pantheon-systems/push-to-pantheon handles unshallowing.
-          fetch-depth: 1
+          # Full clone — upstream pantheon-systems/push-to-pantheon@0.9.0's
+          # prepare_site_root trips "fatal: shallow file has changed since we
+          # read it" when our pre-commit step writes a new commit on top of a
+          # shallow HEAD. A full clone removes the .git/shallow file entirely
+          # and the race can't fire. Small checkout cost vs. unrecoverable
+          # mid-step failure.
+          fetch-depth: 0
 
       - name: Install Terminus
         uses: Square360/shared-workflows/.github/actions/terminus-install@v3.2.5
