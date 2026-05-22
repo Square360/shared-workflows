@@ -2,6 +2,28 @@
 
 This file tracks the work done together with GitHub Copilot on the Square360 Shared Pantheon Workflows repository.
 
+## 2026-05-22 (later)
+
+### Fix - pre-flight terminus field query: `connection:info` → `env:info` (v3.2.5)
+
+- **The bug shipped in v3.2.4.** The pre-flight SFTP-mode check in `.github/actions/pantheon-push/action.yml` was querying the wrong terminus subcommand for the `connection_mode` field:
+
+  ```bash
+  MODE=$(terminus connection:info "${SITE}.${TARGET_ENV}" --field=connection_mode)
+  ```
+
+  `connection_mode` lives on `env:info`, not `connection:info` (which only returns git/sftp connection URLs and commands). Terminus exits 1 with `The requested field, 'connection_mode', is not defined.` The fix is a one-word change:
+
+  ```bash
+  MODE=$(terminus env:info "${SITE}.${TARGET_ENV}" --field=connection_mode)
+  ```
+- **Why this slipped past v3.2.4's Yale Health validation:** the original code had `2>/dev/null || echo ""` swallowing terminus errors, so MODE was always empty, the `!= "git"` check always tripped, and `connection:set git` ran defensively every single time — masking the broken field query. Copilot's review on PR #101 correctly flagged the stderr suppression and we removed it. That surfaced this real bug on the first v3.2.5-released consumer deploy (Yale Health, immediately after the plugin v2.0.18 release).
+- **Out-of-scope but confirmed sound:** `terminus connection:info "${SITE}.${TARGET_ENV}" --field=git_url` in the verify-after-push step is correct — `git_url` is on `connection:info`. Only the pre-flight call was wrong.
+
+### Maintenance - Self-reference bumps to v3.2.5
+
+- **Bumped all in-repo `uses:` self-references from `@v3.2.4` to `@v3.2.5`** across the four `reusable-pantheon-deploy-*.yml` workflows. Same pin-drift-trap discipline as prior releases.
+
 ## 2026-05-22
 
 ### Fix - `pantheon-push` fails loudly when Pantheon rejects the push (v3.2.4)

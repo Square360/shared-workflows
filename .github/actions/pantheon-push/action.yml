@@ -132,10 +132,15 @@ runs:
           echo "Env ${SITE}.${TARGET_ENV} does not exist yet; multidev:create will provision it in git mode. Skipping connection-mode check."
           exit 0
         fi
-        # No 2>/dev/null fallback — if connection:info errors here (auth, network),
-        # we want the step to fail with terminus's real error rather than coerce
-        # the result to an empty string and attempt connection:set on bad data.
-        MODE=$(terminus connection:info "${SITE}.${TARGET_ENV}" --field=connection_mode)
+        # `connection_mode` lives on env:info, NOT on connection:info (which
+        # only returns the git/sftp connection URLs and commands). v3.2.4
+        # shipped with the wrong command — terminus errors with "The requested
+        # field, 'connection_mode', is not defined" — and the no-stderr-swallow
+        # fix from Copilot's review surfaced it.
+        # No `2>/dev/null` fallback: if terminus errors here (auth, network,
+        # schema drift), we want the step to fail with the real error rather
+        # than coerce the result to empty and attempt connection:set on bad data.
+        MODE=$(terminus env:info "${SITE}.${TARGET_ENV}" --field=connection_mode)
         echo "Current connection mode for ${SITE}.${TARGET_ENV}: ${MODE}"
         if [[ "${MODE}" != "git" ]]; then
           echo "::warning::${SITE}.${TARGET_ENV} is in '${MODE}' mode. Switching to git so the push isn't rejected by the pre-receive hook."
