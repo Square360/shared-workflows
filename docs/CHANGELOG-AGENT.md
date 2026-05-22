@@ -2,6 +2,36 @@
 
 This file tracks the work done together with GitHub Copilot on the Square360 Shared Pantheon Workflows repository.
 
+## 2026-05-22
+
+### Fix - `pantheon-push` fails loudly when Pantheon rejects the push (v3.2.4)
+
+- **The problem (YH-571 / Yale-Health-Drupal PR #126):** `pantheon-systems/push-to-pantheon@0.9.0` does not propagate the exit code from `git push`. When Pantheon's pre-receive hook rejects the push (env in SFTP mode, branch protection, lost-update race, etc.), the upstream action reports the step as successful, `bobheadxi/deployments@v1` (invoked inside the upstream) marks the GitHub deployment "success," and the consumer workflow continues — posting "🚀 Multidev Environment Ready!" on the PR while Pantheon still has the old SHA. Discovered when a security fix appeared deployed but `drush deploy` ran on stale code and re-installed a module we'd intentionally removed.
+- **Two defensive layers added to `.github/actions/pantheon-push/action.yml`:**
+  1. **Pre-flight SFTP-mode flip** — before invoking the upstream push, check `terminus connection:info <site>.<env> --field=connection_mode` and call `terminus connection:set <site>.<env> git` if it's anything other than `git`. Catches the most common cause of the silent rejection. Skipped when the env doesn't exist yet (multidev:create provisions in git mode).
+  2. **Verify-after-push** — after the upstream push step, compare `git rev-parse HEAD` (our local artifact commit) against `git ls-remote <pantheon-git-url> refs/heads/<target_env>`. If they differ, fail the workflow with a clear actionable error pointing the developer at the previous step's rejection notice. Belt-and-braces: catches *any* future silent-fail mode in the upstream, not just SFTP.
+- **`if: success()` gate on the PR-comment step** in `.github/workflows/reusable-pantheon-deploy-pr-multidev.yml` so the "Multidev Environment Ready!" PR comment doesn't post when the deploy actually failed.
+- **What this doesn't fix:** the `bobheadxi/deployments@v1` "deployment status: success" call lives inside the upstream `pantheon-systems/push-to-pantheon@0.9.0` action and runs before our verify step. The deployment record on the GitHub Deployments tab will still show success briefly until the workflow itself goes red. Fixing that requires either forking the upstream or adding a follow-up `bobheadxi/deployments@v1` "set status to failure" step in our reusable workflows — deferred. The job-level red state is enough to break the false-positive in CI.
+- **Out-of-scope upstream issue:** the underlying bug should also be filed upstream at `pantheon-systems/push-to-pantheon`, but that won't unblock us on any reasonable timeframe.
+- See `docs/todo/pantheon-push-swallows-rejection.md` (marked RESOLVED in v3.2.4) for the full investigation.
+
+### Maintenance - Self-reference bumps to v3.2.4
+
+- **Bumped all in-repo `uses:` self-references from `@v3.2.3` to `@v3.2.4`** across:
+  - `reusable-pantheon-deploy-dev.yml`
+  - `reusable-pantheon-deploy-pr-multidev.yml`
+  - `reusable-pantheon-deploy-rc-multidev.yml`
+  - `reusable-pantheon-deploy-epic-multidev.yml`
+- Affects: `terminus-install`, `pantheon-push`, `pantheon-post-deploy-drush`, `reusable-semantic-release.yml`, `reusable-pantheon-security-scan.yml`, `reusable-pantheon-vrt.yml`
+- IDE flags these as "Unable to resolve" until the v3.2.4 tag exists — expected; semantic-release tags on merge to `main` and the diagnostics resolve themselves.
+
+### Validation plan (manual, in Yale Health)
+
+1. Merge to `main` → semantic-release tags `v3.2.4`
+2. **Don't yet** bump `pantheon-github-workflows` template SHAs or push the consumer composer plugin — point Yale Health workflows manually at `@v3.2.4` first
+3. Reproduce the original failure mode: `terminus connection:set yalehealth-yale-edu.pr-126 sftp`, re-trigger the workflow, confirm it now fails loudly with the pre-flight warning OR the verify-after-push error (the pre-flight should catch SFTP first; the verify-after-push is the catch-all)
+4. Once verified in Yale Health, do the full release chain: capture SHA → bump `pantheon-github-workflows` templates → Satis rebuild → composer plugin version bump
+
 ## 2026-05-21
 
 ### Feature - `pantheon-post-deploy-drush` switches to `drush deploy` (v3.2.0)
