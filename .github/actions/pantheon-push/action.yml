@@ -147,6 +147,55 @@ runs:
           terminus connection:set "${SITE}.${TARGET_ENV}" git
         fi
 
+    # Upstream pantheon-systems/push-to-pantheon@0.9.0 has an unguarded
+    # `git fetch --unshallow origin` at scripts/main.sh:352 inside
+    # prepare_site_root (the empty-SITE_ROOT branch we take). It blows up two
+    # different ways depending on the checkout state:
+    #   - On a shallow clone (fetch-depth: 1): races with the runner's git
+    #     state and exits 128 with "fatal: shallow file has changed since we
+    #     read it". Intermittent.
+    #   - On a complete clone (fetch-depth: 0): errors deterministically with
+    #     "fatal: --unshallow on a complete repository does not make sense".
+    # Either way it aborts the deploy before our verify-after-push step can
+    # run, and the GitHub deployment is left marked "success" by upstream's
+    # bobheadxi/deployments@v1 wrapper despite the failure.
+    #
+    # Upstream itself does the right thing later in push_to_pantheon (line 382):
+    # `is-shallow-repository` guard + `||` fallback. The bug is specifically
+    # the unguarded call in prepare_site_root.
+    #
+    # We can't edit upstream, so we sed-patch its main.sh on the runner before
+    # invoking the action. The patch appends `|| true` to the unshallow line —
+    # tolerating both failure modes. Safe because the redundant deepen-on-push
+    # at line 382 still runs, properly guarded, before the actual `git push`.
+    #
+    # Pinned to upstream 0.9.0 — if we ever bump that, this step needs to be
+    # re-validated against the new source (sed pattern may not match).
+    - name: Patch upstream push-to-pantheon to tolerate unshallow errors
+      shell: bash
+      env:
+        UPSTREAM_VERSION: "0.9.0"
+      run: |
+        set -euo pipefail
+        UPSTREAM_SCRIPT="/home/runner/work/_actions/pantheon-systems/push-to-pantheon/${UPSTREAM_VERSION}/scripts/main.sh"
+        if [ ! -f "${UPSTREAM_SCRIPT}" ]; then
+          echo "::error::Cannot find upstream main.sh at ${UPSTREAM_SCRIPT}. Has the upstream action version or layout changed?"
+          exit 1
+        fi
+        if grep -qF 'git fetch --unshallow origin || true' "${UPSTREAM_SCRIPT}"; then
+          echo "Upstream already patched; skipping (idempotent re-run)."
+          exit 0
+        fi
+        # The target line is tab-indented in upstream source: `\tgit fetch --unshallow origin`
+        sed -i 's|^\([[:space:]]*\)git fetch --unshallow origin$|\1git fetch --unshallow origin || true|' "${UPSTREAM_SCRIPT}"
+        if ! grep -qF 'git fetch --unshallow origin || true' "${UPSTREAM_SCRIPT}"; then
+          echo "::error::Sed patch did not apply. Upstream main.sh may have changed shape."
+          echo "Lines mentioning unshallow:"
+          grep -n 'unshallow' "${UPSTREAM_SCRIPT}" || true
+          exit 1
+        fi
+        echo "Patched upstream main.sh: prepare_site_root's --unshallow is now tolerant."
+
     - name: Push to Pantheon
       uses: pantheon-systems/push-to-pantheon@0.9.0
       env:
