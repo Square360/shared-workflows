@@ -1,5 +1,5 @@
 name: 'Pantheon post-deploy Drush commands'
-description: 'Runs `drush deploy` (updatedb → cache:rebuild → config:import → cache:rebuild → deploy:hook) plus a Pantheon edge cache flush on a Pantheon environment. Honors [verbose] PR-title flag for -v on drush deploy. Requires Terminus to already be installed and authenticated.'
+description: 'Runs `drush deploy` (updatedb → cache:rebuild → config:import → cache:rebuild → deploy:hook), forces maintenance mode off, then flushes the Pantheon edge cache. Honors [verbose] PR-title flag for -v on drush deploy. Requires Terminus to already be installed and authenticated.'
 
 inputs:
   site:
@@ -113,6 +113,15 @@ runs:
 
         echo "🚀 Running drush deploy (updb → cr → cim → cr → deploy:hook)"
         retry_drush "drush deploy" terminus -n drush "${SITE}.${ENV}" -- deploy $DEPLOY_FLAGS
+
+        # Belt-and-braces: drush deploy can leave the site in maintenance
+        # mode if an update hook or deploy hook enabled it (or if the caller
+        # workflow set it pre-deploy and crashed before unsetting). Force
+        # it off and rebuild caches so the maintenance state propagates.
+        # state:set is idempotent — safe to retry.
+        echo "🔓 Forcing maintenance mode off"
+        retry_drush "maintenance_mode off" terminus -n drush "${SITE}.${ENV}" -- state:set system.maintenance_mode 0 --input-format=integer -y
+        retry_drush "cache:rebuild" terminus -n drush "${SITE}.${ENV}" -- cache:rebuild
 
         # drush deploy's internal cache:rebuild clears Drupal's container
         # cache but not Pantheon's edge/CDN cache. Flush it so users see
