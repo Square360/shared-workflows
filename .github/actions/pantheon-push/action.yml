@@ -186,8 +186,10 @@ runs:
           echo "Upstream already patched; skipping (idempotent re-run)."
           exit 0
         fi
-        # The target line is tab-indented in upstream source: `\tgit fetch --unshallow origin`
-        sed -i 's|^\([[:space:]]*\)git fetch --unshallow origin$|\1git fetch --unshallow origin || true|' "${UPSTREAM_SCRIPT}"
+        # The target line is tab-indented in upstream source: `\tgit fetch --unshallow origin`.
+        # Use `#` as the sed delimiter — the replacement contains `||` and `|` would be
+        # interpreted as the end-of-replacement separator (sed: unknown option to `s`).
+        sed -i 's#^\([[:space:]]*\)git fetch --unshallow origin$#\1git fetch --unshallow origin || true#' "${UPSTREAM_SCRIPT}"
         if ! grep -qF 'git fetch --unshallow origin || true' "${UPSTREAM_SCRIPT}"; then
           echo "::error::Sed patch did not apply. Upstream main.sh may have changed shape."
           echo "Lines mentioning unshallow:"
