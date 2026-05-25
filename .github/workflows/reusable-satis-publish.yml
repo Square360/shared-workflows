@@ -132,11 +132,8 @@ jobs:
           set -euo pipefail
           vendor="${PKG%%/*}"
           name="${PKG#*/}"
-          ver="${VER#v}"   # Composer/satis versions are unprefixed; strip a leading "v".
-          url="$SATIS_URL/api/packages/$vendor/$name"
-          [ -n "$ver" ] && url="$url?version=$ver"
-          echo "GET $url"
-          http_code=$(curl -sS -o /tmp/pkg.json -w '%{http_code}' "$url" \
+          http_code=$(curl -sS -o /tmp/pkg.json -w '%{http_code}' \
+            "$SATIS_URL/api/packages/$vendor/$name" \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/json")
           echo "HTTP $http_code"; cat /tmp/pkg.json; echo
           if [ "$http_code" = "404" ]; then
@@ -147,14 +144,18 @@ jobs:
             echo "::error::Unexpected HTTP $http_code verifying $PKG."
             exit 1
           fi
-          if [ -n "$ver" ]; then
-            has=$(jq -r '.has_version' /tmp/pkg.json)
-            if [ "$has" != "true" ]; then
-              echo "::error::$PKG $ver is not yet published (has_version=$has)."
-              echo "Published versions:"; jq -r '.versions[]?' /tmp/pkg.json
+          if [ -n "$VER" ]; then
+            # satis stores each tag verbatim: a v-prefixed tag publishes as "vX.Y.Z",
+            # a bare tag as "X.Y.Z". Accept whichever form the release tag took.
+            bare="${VER#v}"
+            if jq -e --arg a "$VER" --arg b "$bare" --arg c "v$bare" \
+                 '.versions as $v | (($v|index($a))!=null) or (($v|index($b))!=null) or (($v|index($c))!=null)' \
+                 /tmp/pkg.json >/dev/null; then
+              echo "::notice::Confirmed $PKG $VER is live on $SATIS_URL."
+            else
+              echo "::error::$PKG $VER is not yet published. Published versions: $(jq -c '.versions' /tmp/pkg.json)"
               exit 1
             fi
-            echo "::notice::Confirmed $PKG $ver is live on $SATIS_URL."
           else
             echo "::notice::Confirmed $PKG exists on $SATIS_URL."
           fi
