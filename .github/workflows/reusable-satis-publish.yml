@@ -1,0 +1,160 @@
+name: Reusable Satis Publish
+
+# Triggers a SatisBoss rebuild and polls until the package index on
+# packages.square360.com reflects the new release. Designed to be called from an
+# s360_* module repo after a release is published, so a tag turns into a live
+# Composer version hands-free.
+#
+# Contract (matches the SatisBoss /api endpoints):
+#   POST /api/build/trigger            -> 202 { buildId }  | 409 if a build is already running
+#   GET  /api/build/status/:buildId    -> { data: { status: pending|running|complete|failed, output, ... } }
+#   GET  /api/build/last               -> { data: { id, ... } }
+#   GET  /api/packages/:vendor/:name?version=X.Y.Z -> { has_version: bool, versions: [...] }
+
+on:
+  workflow_call:
+    inputs:
+      satis_url:
+        description: 'SatisBoss base URL'
+        required: false
+        type: string
+        default: 'https://satisboss.square360.com'
+      timeout_seconds:
+        description: 'Maximum seconds to wait for the build to reach a terminal state'
+        required: false
+        type: number
+        default: 300
+      poll_interval_seconds:
+        description: 'Seconds between status polls'
+        required: false
+        type: number
+        default: 10
+      verify_package:
+        description: 'Composer package (vendor/name) to confirm got published. Empty = skip verification.'
+        required: false
+        type: string
+        default: ''
+      verify_version:
+        description: 'Version to confirm is published (a leading "v" is stripped). Empty = confirm the package exists but skip the per-version check.'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SATISBOSS_KEY:
+        description: 'Bearer token minted on SatisBoss (/api/keys/mint)'
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Trigger satis rebuild and poll
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger build
+        id: trigger
+        env:
+          SATIS_URL: ${{ inputs.satis_url }}
+          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+        run: |
+          set -euo pipefail
+          echo "POST $SATIS_URL/api/build/trigger"
+          http_code=$(curl -sS -o /tmp/trigger.json -w '%{http_code}' -X POST \
+            "$SATIS_URL/api/build/trigger" \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json")
+          echo "HTTP $http_code"; cat /tmp/trigger.json; echo
+          case "$http_code" in
+            202)
+              build_id=$(jq -r '.buildId' /tmp/trigger.json)
+              echo "Triggered build $build_id"
+              ;;
+            409)
+              echo "A build is already running; polling the most recent build instead."
+              build_id=$(curl -sS "$SATIS_URL/api/build/last" \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" | jq -r '.data.id')
+              echo "Most recent build is $build_id"
+              ;;
+            *)
+              echo "::error::Unexpected HTTP $http_code from /api/build/trigger"
+              exit 1
+              ;;
+          esac
+          if [ -z "$build_id" ] || [ "$build_id" = "null" ]; then
+            echo "::error::Could not determine a build id to poll"
+            exit 1
+          fi
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
+
+      - name: Poll until build reaches a terminal state
+        env:
+          SATIS_URL: ${{ inputs.satis_url }}
+          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+          BUILD_ID: ${{ steps.trigger.outputs.build_id }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+          INTERVAL: ${{ inputs.poll_interval_seconds }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + TIMEOUT ))
+          while true; do
+            data=$(curl -sS "$SATIS_URL/api/build/status/$BUILD_ID" \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json")
+            status=$(echo "$data" | jq -r '.data.status')
+            echo "build $BUILD_ID status: $status"
+            case "$status" in
+              complete)
+                echo "::notice::Satis build $BUILD_ID complete — package index updated."
+                echo "$data" | jq -r '.data.output // ""'
+                break
+                ;;
+              failed)
+                echo "::error::Satis build $BUILD_ID failed."
+                echo "$data" | jq -r '.data.output // ""'
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out after ${TIMEOUT}s waiting for build $BUILD_ID (last status: $status)."
+              exit 1
+            fi
+            sleep "$INTERVAL"
+          done
+
+      - name: Verify the version is published
+        if: ${{ inputs.verify_package != '' }}
+        env:
+          SATIS_URL: ${{ inputs.satis_url }}
+          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+          PKG: ${{ inputs.verify_package }}
+          VER: ${{ inputs.verify_version }}
+        run: |
+          set -euo pipefail
+          vendor="${PKG%%/*}"
+          name="${PKG#*/}"
+          ver="${VER#v}"   # Composer/satis versions are unprefixed; strip a leading "v".
+          url="$SATIS_URL/api/packages/$vendor/$name"
+          [ -n "$ver" ] && url="$url?version=$ver"
+          echo "GET $url"
+          http_code=$(curl -sS -o /tmp/pkg.json -w '%{http_code}' "$url" \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json")
+          echo "HTTP $http_code"; cat /tmp/pkg.json; echo
+          if [ "$http_code" = "404" ]; then
+            echo "::error::Package $PKG not found on $SATIS_URL after the build. Check the package_name in satis matches composer.json."
+            exit 1
+          fi
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Unexpected HTTP $http_code verifying $PKG."
+            exit 1
+          fi
+          if [ -n "$ver" ]; then
+            has=$(jq -r '.has_version' /tmp/pkg.json)
+            if [ "$has" != "true" ]; then
+              echo "::error::$PKG $ver is not yet published (has_version=$has)."
+              echo "Published versions:"; jq -r '.versions[]?' /tmp/pkg.json
+              exit 1
+            fi
+            echo "::notice::Confirmed $PKG $ver is live on $SATIS_URL."
+          else
+            echo "::notice::Confirmed $PKG exists on $SATIS_URL."
+          fi
