@@ -36,24 +36,9 @@ on:
         type: boolean
         default: false
     secrets:
-      PANTHEON_SSH_KEY:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-      PANTHEON_MACHINE_TOKEN:
-        required: true
-      SLACK_BOT_TOKEN:
-        required: false
-      AWS_ACCESS_KEY_ID:
-        required: false
-      AWS_SECRET_ACCESS_KEY:
-        required: false
-      AWS_S3_BUCKET:
-        required: false
-      AWS_S3_REGION:
-        required: false
-      CLICKUP_API_TOKEN:
-        required: false
-      CLICKUP_TEAM_ID:
-        required: false
+        description: '1Password service account token — loads all CI secrets from s360-cicd vault'
 
 defaults:
   run:
@@ -78,6 +63,19 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
+          PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
+
       - name: Derive multidev name from ISO week
         id: derive
         run: |
@@ -88,14 +86,14 @@ jobs:
           echo "Derived RC multidev name: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4.0.0-beta.3
         with:
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
       - name: Determine source environment
         id: source_env
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
         run: |
           # RC multidevs prefer live as the source (so the RC starts from the
@@ -111,22 +109,22 @@ jobs:
 
       - name: Push code to Pantheon multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4.0.0-beta.3
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
           source_env: ${{ steps.source_env.outputs.source_env }}
-          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          ssh_key: ${{ env.PANTHEON_SSH_KEY }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           commit_message: 'Automated deployment from GitHub Actions to RC multidev ${{ steps.derive.outputs.target_env }}'
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4.0.0-beta.3
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           skip: ${{ inputs.workflow_skip_terminus }}
           # No pr_title for push events; [verbose] flag doesn't apply here.
           pr_title: ''
@@ -134,7 +132,7 @@ jobs:
       - name: Get multidev URL
         id: multidev_url
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
           TARGET_ENV: ${{ steps.derive.outputs.target_env }}
         run: |
@@ -165,22 +163,13 @@ jobs:
     needs: deploy_rc_multidev
     # The security workflow detects rc-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding). No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.2.6
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v4.0.0-beta.3
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
       slack_channel: ${{ inputs.slack_channel }}
-    # `secrets: inherit` only forwards secrets defined on the calling workflow's
-    # own repo/org. Since this reusable workflow is called cross-org from
-    # consumer Drupal sites, the inherited secrets aren't ours to forward —
-    # explicit pass-through is required.
     secrets:
-      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-      AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
   visual_regression:
     name: Visual Regression (opt-in)
@@ -193,7 +182,7 @@ jobs:
         contains(github.event.head_commit.message, '[run-vrt]') ||
         contains(github.event.head_commit.message, '[vrt]')
       }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v3.2.6
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v4.0.0-beta.3
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
@@ -202,16 +191,8 @@ jobs:
       # on push events. We've already gated this job on the commit message
       # above, so tell VRT to skip its own check and just run.
       force_run: true
-    # See note above the security_scan job's secrets block — same constraint.
     secrets:
-      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-      AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
-      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-      CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
   notify_slack:
     name: Notify Slack
@@ -219,9 +200,21 @@ jobs:
     if: ${{ always() && inputs.slack_channel }}
     runs-on: ubuntu-latest
     steps:
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+
       - name: Send Slack notification
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ inputs.slack_channel }}
           DEPLOY_RESULT: ${{ needs.deploy_rc_multidev.result }}
           MULTIDEV_URL: ${{ needs.deploy_rc_multidev.outputs.multidev_url }}

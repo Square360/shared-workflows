@@ -41,24 +41,9 @@ on:
         type: boolean
         default: false
     secrets:
-      PANTHEON_SSH_KEY:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-      PANTHEON_MACHINE_TOKEN:
-        required: true
-      SLACK_BOT_TOKEN:
-        required: false
-      CLICKUP_API_TOKEN:
-        required: false
-      CLICKUP_TEAM_ID:
-        required: false
-      AWS_ACCESS_KEY_ID:
-        required: false
-      AWS_SECRET_ACCESS_KEY:
-        required: false
-      AWS_S3_BUCKET:
-        required: false
-      AWS_S3_REGION:
-        required: false
+        description: '1Password service account token — loads all CI secrets from s360-cicd vault'
 
 defaults:
   run:
@@ -84,6 +69,21 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
+          PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
       - name: Derive multidev name from epic branch
         id: derive
@@ -126,14 +126,14 @@ jobs:
           echo "Epic multidev: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4.0.0-beta.3
         with:
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
       - name: Check if epic multidev environment exists
         id: check_env
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
           TARGET_ENV: ${{ steps.derive.outputs.target_env }}
         run: |
@@ -148,22 +148,22 @@ jobs:
 
       - name: Push code to Pantheon epic multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4.0.0-beta.3
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
           source_env: dev
-          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          ssh_key: ${{ env.PANTHEON_SSH_KEY }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           commit_message: 'Automated deployment from GitHub Actions to epic multidev ${{ steps.derive.outputs.target_env }}'
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4.0.0-beta.3
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           skip: ${{ inputs.workflow_skip_terminus }}
           # No pr_title for push events; [verbose] flag doesn't apply.
           pr_title: ''
@@ -171,7 +171,7 @@ jobs:
       - name: Get epic multidev URL
         id: multidev_url
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
           TARGET_ENV: ${{ steps.derive.outputs.target_env }}
         run: |
@@ -182,8 +182,8 @@ jobs:
       - name: Comment on ClickUp epic ticket with multidev URL
         continue-on-error: true
         env:
-          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-          CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+          CLICKUP_API_TOKEN: ${{ env.CLICKUP_API_TOKEN }}
+          CLICKUP_TEAM_ID: ${{ env.CLICKUP_TEAM_ID }}
           MULTIDEV_URL: ${{ steps.multidev_url.outputs.url }}
           TARGET_ENV: ${{ steps.derive.outputs.target_env }}
           ENV_IS_NEW: ${{ steps.check_env.outputs.env_is_new }}
@@ -234,24 +234,13 @@ jobs:
     # The security workflow detects epr-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding) — same gate as rc-*,
     # per the Square360 SOP for epic integration multidevs. No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v3.2.6
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v4.0.0-beta.3
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_epic_multidev.outputs.target_env }}
       slack_channel: ${{ inputs.slack_channel }}
-    # `secrets: inherit` only forwards secrets defined on the calling workflow's
-    # own repo/org. Since this reusable workflow is called cross-org from
-    # consumer Drupal sites, the inherited secrets aren't ours to forward —
-    # explicit pass-through is required.
     secrets:
-      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-      AWS_S3_REGION: ${{ secrets.AWS_S3_REGION }}
-      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-      CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
   notify_slack:
     name: Notify Slack
@@ -259,9 +248,21 @@ jobs:
     if: ${{ always() && inputs.slack_channel }}
     runs-on: ubuntu-latest
     steps:
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+
       - name: Send Slack notification
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ inputs.slack_channel }}
           DEPLOY_RESULT: ${{ needs.deploy_epic_multidev.result }}
           MULTIDEV_URL: ${{ needs.deploy_epic_multidev.outputs.multidev_url }}
