@@ -19,8 +19,9 @@ on:
         type: boolean
         default: false
     secrets:
-      CI_GH_TOKEN:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
+        description: '1Password service account token — loads CI_GH_TOKEN from s360-cicd vault'
 
 defaults:
   run:
@@ -40,6 +41,18 @@ jobs:
           ref: ${{ github.event.pull_request.base.ref || github.ref }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          CI_GH_TOKEN: op://s360-cicd/github/token
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -201,4 +214,4 @@ jobs:
             npx semantic-release
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.CI_GH_TOKEN }}
+          GITHUB_TOKEN: ${{ env.CI_GH_TOKEN }}
