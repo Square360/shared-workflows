@@ -16,6 +16,11 @@ name: Reusable Deploy to Pantheon DEV
 #
 # PR-title flag support is delegated to pantheon-post-deploy-drush:
 #   [verbose]  — pass -v to drush deploy
+#
+# v4: secrets loaded from 1Password via OP_SERVICE_ACCOUNT_TOKEN.
+#     The only GitHub secret required is OP_SERVICE_ACCOUNT_TOKEN (org-level).
+#     All other credentials (Pantheon, Slack) are resolved at runtime from
+#     the s360-cicd vault.
 # -----------------------------------------------------------------------------
 
 on:
@@ -45,14 +50,9 @@ on:
         type: boolean
         default: false
     secrets:
-      PANTHEON_SSH_KEY:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-      PANTHEON_MACHINE_TOKEN:
-        required: true
-      CI_GH_TOKEN:
-        required: false
-      SLACK_BOT_TOKEN:
-        required: false
+        description: '1Password service account token — loads all CI secrets from s360-cicd vault'
 
 defaults:
   run:
@@ -62,9 +62,9 @@ jobs:
   semantic_release:
     name: Semantic Release
     if: ${{ inputs.run_semantic_release }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@v3.2.6
+    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@v4.0.0-beta.1
     secrets:
-      CI_GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
   deploy_to_pantheon_dev:
     name: Deploy to Pantheon DEV
@@ -91,10 +91,23 @@ jobs:
           # Shallow clone — pantheon-systems/push-to-pantheon handles unshallowing.
           fetch-depth: 1
 
-      - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@v3.2.6
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
         with:
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
+          PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
+
+      - name: Install Terminus
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4.0.0-beta.1
+        with:
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
       # -----------------------------------------------------------------------
       # Push code to Pantheon DEV. target_env is hardcoded; source_env is
@@ -102,12 +115,12 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Push code to Pantheon DEV
         id: deploy_pantheon
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4.0.0-beta.1
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: dev
-          ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          ssh_key: ${{ env.PANTHEON_SSH_KEY }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
       # -----------------------------------------------------------------------
       # Backup-on-live safety net: if the last live backup is older than the
@@ -122,7 +135,7 @@ jobs:
       - name: Check last live backup age
         id: last_backup
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
           THRESHOLD_HOURS: ${{ inputs.backup_hours_threshold }}
         run: |
@@ -150,7 +163,7 @@ jobs:
         id: create_backup
         if: ${{ steps.last_backup.outputs.needs_backup == 'true' }}
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
         run: |
           echo "Creating backup on live (keep-for 30 days)"
@@ -159,18 +172,18 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v3.2.6
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4.0.0-beta.1
         with:
           site: ${{ inputs.pantheon_site }}
           env: dev
-          machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           skip: ${{ inputs.workflow_skip_terminus }}
           pr_title: ${{ github.event.pull_request.title }}
 
       - name: Get environment URL
         id: env_url
         env:
-          TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
           SITE: ${{ inputs.pantheon_site }}
         run: |
           URL=$(terminus env:view "${SITE}.dev" --print)
@@ -207,9 +220,21 @@ jobs:
     if: ${{ always() && inputs.slack_channel }}
     runs-on: ubuntu-latest
     steps:
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+
       - name: Send Slack notification
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ inputs.slack_channel }}
           SEMANTIC_RESULT: ${{ needs.semantic_release.result }}
           DEPLOY_RESULT: ${{ needs.deploy_to_pantheon_dev.result }}

@@ -21,16 +21,9 @@ on:
         type: boolean
         default: false
     secrets:
-      PANTHEON_SSH_KEY:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-      PANTHEON_MACHINE_TOKEN:
-        required: true
-      SLACK_BOT_TOKEN:
-        required: false
-      CLICKUP_API_TOKEN:
-        required: false
-      CLICKUP_TEAM_ID:
-        required: false
+        description: '1Password service account token — loads all CI secrets from s360-cicd vault'
 
 defaults:
   run:
@@ -54,9 +47,24 @@ jobs:
         # Use shallow clone to let pantheon action handle unshallowing
         fetch-depth: 1
 
+    - name: Configure 1Password
+      uses: 1password/load-secrets-action/configure@v2
+      with:
+        service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    - name: Load secrets
+      uses: 1password/load-secrets-action@v2
+      with:
+        export-env: true
+      env:
+        PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
+        PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
+        CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+        CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
+
     - name: Install Terminus
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
         curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" -o /usr/local/bin/terminus
@@ -67,7 +75,7 @@ jobs:
     - name: Determine source environment
       id: source_env
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         TARGET_ENV="${{ inputs.target_env }}"
 
@@ -94,7 +102,7 @@ jobs:
     - name: Check if multidev environment exists
       id: check_env
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         echo "Checking if environment ${{ inputs.pantheon_site }}.${{ inputs.target_env }} exists..."
         terminus env:info ${{ inputs.pantheon_site }}.${{ inputs.target_env }} && ENV_EXISTS=true || ENV_EXISTS=false
@@ -138,8 +146,8 @@ jobs:
       env:
         COMPOSER_NO_SECURITY_BLOCKING: 1
       with:
-        ssh_key: ${{ secrets.PANTHEON_SSH_KEY }}
-        machine_token: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        ssh_key: ${{ env.PANTHEON_SSH_KEY }}
+        machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
         site: ${{ inputs.pantheon_site }}
         target_env: ${{ inputs.target_env }}
         source_env: ${{ steps.source_env.outputs.source_env }}
@@ -153,7 +161,7 @@ jobs:
       if: ${{ !inputs.workflow_skip_terminus }}
       id: drush_commands
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         # Check PR title for order preference and verbosity
         # Use HERE document to safely handle all special characters
@@ -184,7 +192,7 @@ jobs:
     - name: Get multidev URL
       id: multidev_url
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         URL=$(terminus env:view ${{ inputs.pantheon_site }}.${{ inputs.target_env }} --print)
         echo "url=$URL" >> $GITHUB_OUTPUT
@@ -194,8 +202,8 @@ jobs:
       id: clickup_comment
       continue-on-error: true
       env:
-        CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+        CLICKUP_API_TOKEN: ${{ env.CLICKUP_API_TOKEN }}
+        CLICKUP_TEAM_ID: ${{ env.CLICKUP_TEAM_ID }}
       run: |
         set -x
         if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
@@ -291,7 +299,21 @@ jobs:
     if: ${{ always() && inputs.slack_channel }}
     runs-on: ubuntu-latest
     steps:
+    - name: Configure 1Password
+      uses: 1password/load-secrets-action/configure@v2
+      with:
+        service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    - name: Load secrets
+      uses: 1password/load-secrets-action@v2
+      with:
+        export-env: true
+      env:
+        SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+
     - name: Send Slack notification
+      env:
+        SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
       run: |
         # Determine status and message
         if [[ "${{ needs.deploy_to_multidev.result }}" == "success" ]]; then
@@ -343,8 +365,8 @@ jobs:
         fi
 
         # Send to Slack using Bot API
-        if [[ -n "${{ secrets.SLACK_BOT_TOKEN }}" ]]; then
-          curl -X POST -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+        if [[ -n "$SLACK_BOT_TOKEN" ]]; then
+          curl -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
             -H 'Content-type: application/json; charset=utf-8' \
             --data "{
               \"channel\": \"${{ inputs.slack_channel }}\",

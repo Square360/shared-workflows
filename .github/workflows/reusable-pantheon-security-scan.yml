@@ -54,22 +54,9 @@ on:
         type: string
         default: ''
     secrets:
-      PANTHEON_MACHINE_TOKEN:
+      OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-      AWS_ACCESS_KEY_ID:
-        required: true
-      AWS_SECRET_ACCESS_KEY:
-        required: true
-      AWS_S3_BUCKET:
-        required: true
-      AWS_S3_REGION:
-        required: false
-      CLICKUP_API_TOKEN:
-        required: false
-      CLICKUP_TEAM_ID:
-        required: false
-      SLACK_BOT_TOKEN:
-        required: false
+        description: '1Password service account token — loads all CI secrets from s360-cicd vault'
 
 defaults:
   run:
@@ -174,10 +161,31 @@ jobs:
       if: steps.sec_check.outputs.enabled == 'true'
       uses: actions/checkout@v6
 
+    - name: Configure 1Password
+      if: steps.sec_check.outputs.enabled == 'true'
+      uses: 1password/load-secrets-action/configure@v2
+      with:
+        service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    - name: Load secrets
+      if: steps.sec_check.outputs.enabled == 'true'
+      uses: 1password/load-secrets-action@v2
+      with:
+        export-env: true
+      env:
+        PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
+        AWS_ACCESS_KEY_ID: op://s360-cicd/aws-ci/access-key-id
+        AWS_SECRET_ACCESS_KEY: op://s360-cicd/aws-ci/secret-access-key
+        AWS_S3_BUCKET: op://s360-cicd/aws-ci/s3-bucket
+        AWS_S3_REGION: op://s360-cicd/aws-ci/s3-region
+        CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+        CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
+        SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+
     - name: Install Terminus
       if: steps.sec_check.outputs.enabled == 'true'
       env:
-        TERMINUS_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
+        TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
       run: |
         TERMINUS_VERSION=$(curl -s https://api.github.com/repos/pantheon-systems/terminus/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
         curl -fsSL "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" \
@@ -221,8 +229,8 @@ jobs:
       id: s3_urls
       if: steps.sec_check.outputs.enabled == 'true'
       env:
-        AWS_S3_BUCKET:       ${{ secrets.AWS_S3_BUCKET }}
-        AWS_S3_REGION_INPUT: ${{ secrets.AWS_S3_REGION }}
+        AWS_S3_BUCKET:       ${{ env.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT: ${{ env.AWS_S3_REGION }}
         PANTHEON_SITE:       ${{ inputs.pantheon_site }}
       run: |
         REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
@@ -393,10 +401,10 @@ jobs:
       id: s3_upload
       if: steps.sec_check.outputs.enabled == 'true'
       env:
-        AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_S3_BUCKET:         ${{ secrets.AWS_S3_BUCKET }}
-        AWS_S3_REGION_INPUT:   ${{ secrets.AWS_S3_REGION }}
+        AWS_ACCESS_KEY_ID:     ${{ env.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        AWS_S3_BUCKET:         ${{ env.AWS_S3_BUCKET }}
+        AWS_S3_REGION_INPUT:   ${{ env.AWS_S3_REGION }}
         PANTHEON_SITE:         ${{ inputs.pantheon_site }}
         RUN_KEY:               ${{ steps.s3_urls.outputs.run_key }}
         BASE_URL:              ${{ steps.s3_urls.outputs.base_url }}
@@ -551,8 +559,8 @@ jobs:
         steps.sec_check.outputs.clickup_task_id != ''
       continue-on-error: true
       env:
-        CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-        CLICKUP_TEAM_ID:   ${{ secrets.CLICKUP_TEAM_ID }}
+        CLICKUP_API_TOKEN: ${{ env.CLICKUP_API_TOKEN }}
+        CLICKUP_TEAM_ID:   ${{ env.CLICKUP_TEAM_ID }}
         TASK_ID:           ${{ steps.sec_check.outputs.clickup_task_id }}
         REPORT_HTML_URL:   ${{ steps.s3_upload.outputs.report_html_url }}
         REPORT_JSON_URL:   ${{ steps.s3_upload.outputs.report_json_url }}
@@ -655,7 +663,7 @@ jobs:
         steps.sec_check.outputs.enabled == 'true' &&
         inputs.slack_channel != ''
       env:
-        SLACK_BOT_TOKEN:  ${{ secrets.SLACK_BOT_TOKEN }}
+        SLACK_BOT_TOKEN:  ${{ env.SLACK_BOT_TOKEN }}
         SLACK_CHANNEL:    ${{ inputs.slack_channel }}
         REPORT_HTML_URL:  ${{ steps.s3_upload.outputs.report_html_url }}
         REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
