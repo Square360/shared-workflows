@@ -1,0 +1,16 @@
+name: Release
+
+# Fires on every merge to main, computes the next version from conventional-commit
+# messages, tags it, and publishes a GitHub release automatically.
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  semantic_release:
+    uses: ./.github/workflows/reusable-semantic-release.yml
+    with:
+      release_branches: '["main"]'
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
