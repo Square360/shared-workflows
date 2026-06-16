@@ -40,8 +40,8 @@ on:
         type: string
         default: ''
     secrets:
-      SATISBOSS_KEY:
-        description: 'Bearer token minted on SatisBoss (/api/keys/mint)'
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: '1Password service account token — loads SATISBOSS_KEY from s360-cicd vault'
         required: true
 
 defaults:
@@ -53,11 +53,23 @@ jobs:
     name: Trigger satis rebuild and poll
     runs-on: ubuntu-latest
     steps:
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v2
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          SATISBOSS_KEY: op://s360-cicd/satis/key
+
       - name: Trigger build
         id: trigger
         env:
           SATIS_URL: ${{ inputs.satis_url }}
-          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+          TOKEN: ${{ env.SATISBOSS_KEY }}
         run: |
           set -euo pipefail
           echo "POST $SATIS_URL/api/build/trigger"
@@ -90,7 +102,7 @@ jobs:
       - name: Poll until build reaches a terminal state
         env:
           SATIS_URL: ${{ inputs.satis_url }}
-          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+          TOKEN: ${{ env.SATISBOSS_KEY }}
           BUILD_ID: ${{ steps.trigger.outputs.build_id }}
           TIMEOUT: ${{ inputs.timeout_seconds }}
           INTERVAL: ${{ inputs.poll_interval_seconds }}
@@ -125,7 +137,7 @@ jobs:
         if: ${{ inputs.verify_package != '' }}
         env:
           SATIS_URL: ${{ inputs.satis_url }}
-          TOKEN: ${{ secrets.SATISBOSS_KEY }}
+          TOKEN: ${{ env.SATISBOSS_KEY }}
           PKG: ${{ inputs.verify_package }}
           VER: ${{ inputs.verify_version }}
         run: |
