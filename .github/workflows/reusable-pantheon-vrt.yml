@@ -204,7 +204,7 @@ jobs:
       run: |
         REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
         RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
-        BASE_URL="https://${AWS_S3_BUCKET}.s3.${REGION}.amazonaws.com/${PANTHEON_SITE}/${RUN_KEY}"
+        BASE_URL="https://${AWS_S3_BUCKET}.s3.${REGION}.amazonaws.com/vrt/${PANTHEON_SITE}/${RUN_KEY}"
         echo "base_url=${BASE_URL}" >> "$GITHUB_OUTPUT"
         echo "run_key=${RUN_KEY}"   >> "$GITHUB_OUTPUT"
         echo "region=${REGION}"     >> "$GITHUB_OUTPUT"
@@ -743,8 +743,8 @@ jobs:
         export AWS_DEFAULT_REGION
 
         RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
-        S3_PREFIX="s3://${AWS_S3_BUCKET}/${PANTHEON_SITE}/${RUN_KEY}"
-        URL_BASE="https://${AWS_S3_BUCKET}.s3.${AWS_DEFAULT_REGION}.amazonaws.com/${PANTHEON_SITE}/${RUN_KEY}"
+        S3_PREFIX="s3://${AWS_S3_BUCKET}/vrt/${PANTHEON_SITE}/${RUN_KEY}"
+        URL_BASE="https://${AWS_S3_BUCKET}.s3.${AWS_DEFAULT_REGION}.amazonaws.com/vrt/${PANTHEON_SITE}/${RUN_KEY}"
 
         aws s3 cp screenshots/live/ "${S3_PREFIX}/live/" --recursive --quiet
         aws s3 cp screenshots/rc/   "${S3_PREFIX}/rc/"   --recursive --quiet
