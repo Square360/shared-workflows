@@ -1,3 +1,9 @@
+# Release 4.1.1 (2026-07-01)
+
+### Bug Fixes
+
+* vrt: pin js-yaml to v4 and use named import (9b6c2ee)
+
 # Release 4.1.0 (2026-06-16)
 
 ### Features
