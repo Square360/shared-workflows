@@ -182,7 +182,7 @@ jobs:
         contains(github.event.head_commit.message, '[run-vrt]') ||
         contains(github.event.head_commit.message, '[vrt]')
       }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v4.0.0-beta.3
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v4.1.1
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
