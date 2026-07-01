@@ -202,7 +202,7 @@ jobs:
     - name: Install Playwright and dependencies
       if: steps.vrt_check.outputs.enabled == 'true'
       run: |
-        npm install --no-save playwright pixelmatch pngjs js-yaml
+        npm install --no-save playwright pixelmatch pngjs js-yaml@^4
         npx playwright install chromium --with-deps
 
     # -------------------------------------------------------------------------
@@ -217,7 +217,7 @@ jobs:
         import { PNG } from 'pngjs';
         import pixelmatch from 'pixelmatch';
         import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
-        import jsYaml from 'js-yaml';
+        import { load as yamlLoad } from 'js-yaml';
 
         const LIVE_URL        = (process.env.LIVE_URL || '').replace(/\/$/, '');
         const RC_URL          = (process.env.RC_URL || '').replace(/\/$/, '');
@@ -252,7 +252,7 @@ jobs:
         let config = DEFAULT_CONFIG;
         if (existsSync(CONFIG_PATH)) {
           try {
-            config = jsYaml.load(readFileSync(CONFIG_PATH, 'utf8'));
+            config = yamlLoad(readFileSync(CONFIG_PATH, 'utf8'));
             console.log('Loaded vrt-config.yml');
           } catch (e) {
             console.warn(`Failed to parse vrt-config.yml, using defaults: ${e.message}`);
