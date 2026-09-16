@@ -323,7 +323,7 @@ jobs:
         contains(github.event.pull_request.body, '[run-vrt]') ||
         contains(github.event.pull_request.body, '[vrt]')
       }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v4  # moving major tag — advances with each 4.x release
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
