@@ -1,3 +1,10 @@
+# Release 4.10.2 (2026-09-16)
+
+### Bug Fixes
+
+* vrt: call reusable-pantheon-vrt from the multidev workflows at the v4 moving tag instead of the v4.3.0 SHA (cef277b)
+* vrt: send the per-site Pantheon bot-bypass header so the AGCDN challenge stops timing out every screenshot (34359d4)
+
 # Release 4.10.1 (2026-09-03)
 
 ### Bug Fixes
