@@ -166,6 +166,22 @@ jobs:
         CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
         SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
 
+    # Optional per-site bot-bypass token. Pantheon's AGCDN (Cloudflare) serves a
+    # JS challenge to headless Chrome, which never reaches networkidle, so every
+    # screenshot times out (TEDCO rc-2026-38, 2026-09-16: 30/30 timeouts). Sites
+    # behind the challenge store their bypass token as a field named after the
+    # site machine name on the s360-cicd "pantheon-bot-bypass" item. Missing
+    # field = step fails softly and VRT runs without the header, as before.
+    - name: Load bot-bypass token (optional)
+      id: bot_bypass
+      if: steps.vrt_check.outputs.enabled == 'true'
+      continue-on-error: true
+      uses: 1password/load-secrets-action@v5
+      with:
+        export-env: true
+      env:
+        BOT_BYPASS_TOKEN: op://s360-cicd/pantheon-bot-bypass/${{ inputs.pantheon_site }}
+
     - name: Install Terminus
       if: steps.vrt_check.outputs.enabled == 'true'
       env:
@@ -253,6 +269,7 @@ jobs:
         const TARGET_ENV      = process.env.TARGET_ENV || '';
         const PANTHEON_SITE   = process.env.PANTHEON_SITE || '';
         const EXTRA_PAGES_RAW = process.env.EXTRA_PAGES || '';
+        const BOT_BYPASS_TOKEN = process.env.BOT_BYPASS_TOKEN || '';
         const RUN_ID          = process.env.GITHUB_RUN_ID || 'local';
         const RUN_ATTEMPT     = process.env.GITHUB_RUN_ATTEMPT || '1';
         const REPO            = process.env.GITHUB_REPO || '';
@@ -296,6 +313,9 @@ jobs:
         const defaultWait = config.vrt?.wait         ?? 6;
         const viewports   = config.vrt?.viewports    ?? DEFAULT_CONFIG.vrt.viewports;
         const pages       = [...(config.vrt?.pages   ?? DEFAULT_CONFIG.vrt.pages)];
+        const bypassHeader = config.vrt?.bypass_header ?? 'x-pantheon-bot-bypass';
+        const extraHeaders = BOT_BYPASS_TOKEN ? { [bypassHeader]: BOT_BYPASS_TOKEN } : {};
+        console.log(`Bot bypass: ${BOT_BYPASS_TOKEN ? `header ${bypassHeader} set` : 'none (no token for this site)'}`);
 
         // Merge extra paths from the [vrt-pages] block in the PR body.
         // Entries are tab-separated; each entry is /path or /path|waitSeconds.
@@ -355,6 +375,7 @@ jobs:
           const ctx  = await browser.newContext({
             viewport: { width: viewport.width, height: viewport.height },
             reducedMotion: 'reduce',
+            extraHTTPHeaders: extraHeaders,
           });
           const page = await ctx.newPage();
 
@@ -731,6 +752,7 @@ jobs:
         TARGET_ENV:         ${{ inputs.target_env }}
         PANTHEON_SITE:      ${{ inputs.pantheon_site }}
         EXTRA_PAGES:        ${{ steps.vrt_check.outputs.extra_pages }}
+        BOT_BYPASS_TOKEN:   ${{ env.BOT_BYPASS_TOKEN }}
         GITHUB_RUN_ID:      ${{ github.run_id }}
         GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         GITHUB_REPO:        ${{ github.repository }}
