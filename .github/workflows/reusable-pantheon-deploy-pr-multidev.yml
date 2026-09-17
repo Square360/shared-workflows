@@ -289,7 +289,7 @@ jobs:
     # Self-skips with a visible notice when the repo has no smoke-routes.txt.
     needs: deploy_pr_multidev
     if: ${{ inputs.run_route_smoke }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-route-smoke.yml@12edc3ff2b7618d5ee3a5bedb22778894a8aaef8  # v4.8.2 — uli account from ROUTE_SMOKE_ULI_OPTIONS repo/org var
+    uses: Square360/shared-workflows/.github/workflows/reusable-route-smoke.yml@v4  # moving major tag — advances with each 4.x releasent from ROUTE_SMOKE_ULI_OPTIONS repo/org var
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
