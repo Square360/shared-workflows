@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: false
+      clickup_comment:
+        description: 'Forwarded to the VRT and security-scan jobs: post their summaries to the resolved ClickUp task. Default false (S360-1077).'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -234,8 +239,9 @@ jobs:
     # The security workflow detects epr-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding) — same gate as rc-*,
     # per the Square360 SOP for epic integration multidevs. No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v4  # moving major tag — advances with each 4.x release
     with:
+      clickup_comment: ${{ inputs.clickup_comment }}
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_epic_multidev.outputs.target_env }}
       slack_channel: ${{ inputs.slack_channel }}

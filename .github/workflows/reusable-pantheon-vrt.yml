@@ -25,6 +25,13 @@ on:
         required: false
         type: string
         default: ''
+      # Off by default since 2026-09-16 (S360-1077): the run page (job summary)
+      # and Slack carry the result; per-build ClickUp comments swamped release tickets.
+      clickup_comment:
+        description: 'Post the VRT summary as a comment on the resolved ClickUp task. Default false.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -848,8 +855,39 @@ jobs:
 
     # Post VRT results to the ClickUp task identified from [vrt TASK-ID] or branch name.
     # Skipped gracefully if CLICKUP_API_TOKEN / CLICKUP_TEAM_ID are not configured.
+    # Job summary — same table as the PR comment, on the run page (S360-1077).
+    - name: Write job summary
+      if: steps.vrt_check.outputs.enabled == 'true' && steps.run_vrt.conclusion == 'success'
+      env:
+        REPORT_URL:       ${{ steps.s3_upload.outputs.report_url }}
+        REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:       ${{ inputs.target_env }}
+        MULTIDEV_URL:     ${{ steps.get_urls.outputs.rc_url }}
+      run: |
+        node -e '
+          const fs = require("fs");
+          const s  = JSON.parse(fs.readFileSync("vrt-summary.json", "utf8"));
+          const icon = s.allPassed ? "✅" : "❌";
+          const text = s.allPassed ? "All checks passed" : "Some checks failed";
+          const rows = s.results.map(r => {
+            const i = r.error ? "⚠️" : (r.passed ? "✅" : "❌");
+            const d = r.error ? "Error" : `${r.diffPercent}%`;
+            return `| ${i} | ${r.page} | \`${r.path}\` | ${r.viewport} | ${d} |`;
+          }).join("\n");
+          const out = [
+            `## ${icon} Visual Regression Test — ${text}`, "",
+            `**${s.passCount} passed, ${s.failCount} failed** · Threshold: ${s.thresholdPercent}%`, "",
+            "| | Page | Path | Viewport | Diff |", "|:---:|---|---|---|---|", rows, "",
+            process.env.REPORT_URL ? `[📊 View Full Report with Screenshots](${process.env.REPORT_URL})` : "",
+            process.env.REPORT_JSON_URL ? `[🤖 AI-readable JSON report](${process.env.REPORT_JSON_URL})` : "", "",
+            `> Multidev: \`${process.env.TARGET_ENV}\` — ${process.env.MULTIDEV_URL}`, "",
+          ].filter(l => l !== null && l !== undefined).join("\n");
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out);
+        '
+
     - name: Comment on ClickUp task
       if: >
+        inputs.clickup_comment == true &&
         steps.vrt_check.outputs.enabled == 'true' &&
         steps.run_vrt.conclusion == 'success' &&
         steps.vrt_check.outputs.clickup_task_id != ''
