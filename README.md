@@ -1,70 +1,40 @@
-# Square360 Shared Pantheon Workflows
+# Square360 Shared Workflows
 
-This repository contains reusable GitHub Actions workflows for Square360 Pantheon projects.
+Reusable GitHub Actions workflows and composite actions for Square360's Pantheon-hosted Drupal sites. Client repos do not call these directly: the `square360/pantheon-github-workflows` Composer plugin installs two thin callers (`deploy-to-dev.yml`, `deploy-multidev.yml`) that reference the reusables below at the `v4` moving major tag.
 
-## Available Workflows
+## Reusable workflows (`.github/workflows/`)
 
-### Pantheon Deployment Workflows
+| Workflow | Runs when | Does |
+|---|---|---|
+| `reusable-pantheon-deploy-dev.yml` | release PR merges to master/main | semantic-release, push to DEV, LIVE backup (verified by listing), `drush deploy`, Slack |
+| `reusable-pantheon-deploy-pr-multidev.yml` | PR opened/updated | `pr-NNN` multidev, php-quality, route-smoke, opt-in ZAP + VRT |
+| `reusable-pantheon-deploy-rc-multidev.yml` | PR merged to develop (real merges only) | `rc-YYYY-WW` multidev, composer-audit gate, route-smoke, ZAP, opt-in VRT |
+| `reusable-pantheon-deploy-epic-multidev.yml` | push to `epic/**` | `epr-*` multidev, ZAP gate |
+| `reusable-pantheon-vrt.yml` | called by the multidev workflows | Playwright screenshots LIVE vs multidev, diff report to S3, job summary |
+| `reusable-pantheon-security-scan.yml` | called by the multidev workflows | OWASP ZAP baseline, reports to S3, job summary |
+| `reusable-route-smoke.yml` | called by the multidev workflows | authenticated key-route checks from `.github/smoke-routes.txt` |
+| `reusable-php-quality.yml` | called by the PR multidev workflow | plugin class-load check + unit suites |
+| `reusable-composer-diff.yml` | PR opened/updated | composer.lock diff as a sticky PR comment |
+| `reusable-semantic-release.yml` | called by the DEV deploy | version + changelog from conventional commits |
+| `reusable-satis-publish.yml` | module/theme repos | verify a tagged package is published on the Satis registry |
 
-#### `reusable-deploy-pantheon.yml`
-Deploys code to Pantheon environments with optional semantic release.
+Each file's header comment is the reference for its inputs, gates, labels and skip flags. Per-repo knobs live in the client repo under `.github/workflow_config/` (`vrt-config.yml`, `.pantheon-workflows-manifest.json`) and `.github/smoke-routes.txt`.
 
-**Usage:**
-```yaml
-jobs:
-  deploy:
-    uses: Square360/shared-pantheon-workflows/.github/workflows/reusable-deploy-pantheon.yml@main
-    with:
-      pantheon_site: ${{ vars.PANTHEON_SITE }}
-      target_env: "dev"
-      backup_hours_threshold: 6
-      run_semantic_release: true
-    secrets:
-      PANTHEON_SSH_KEY: ${{ secrets.PANTHEON_SSH_KEY }}
-      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
-      CI_GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
-```
+## Composite actions (`.github/actions/`)
 
-**Inputs:**
-- `pantheon_site` (required): Pantheon site name
-- `target_env` (optional): Target environment (default: "dev")
-- `backup_hours_threshold` (optional): Hours threshold for backup check (default: 6)
-- `run_semantic_release` (optional): Whether to run semantic release first (default: true)
+- `terminus-install` — pinned Terminus release + machine-token login.
+- `pantheon-push` — PHP + Composer install, push the workspace to a Pantheon env, verify the ref landed.
+- `pantheon-post-deploy-drush` — waits for the env, then `drush deploy` (updb → cr → cim → cr → deploy:hook) and cache clear.
 
-#### `reusable-deploy-multidev.yml`
-Deploys pull requests to Pantheon multidev environments.
+## What a client repo needs
 
-**Usage:**
-```yaml
-jobs:
-  deploy:
-    uses: Square360/shared-pantheon-workflows/.github/workflows/reusable-deploy-multidev.yml@main
-    with:
-      pantheon_site: ${{ vars.PANTHEON_SITE }}
-      pr_number: ${{ github.event.pull_request.number }}
-      base_ref: ${{ github.base_ref }}
-      action: ${{ github.event.action }}
-    secrets:
-      PANTHEON_SSH_KEY: ${{ secrets.PANTHEON_SSH_KEY }}
-      PANTHEON_MACHINE_TOKEN: ${{ secrets.PANTHEON_MACHINE_TOKEN }}
-```
+- **One secret:** `OP_SERVICE_ACCOUNT_TOKEN` (org-level). Every other credential is read from the 1Password `s360-cicd` vault at run time; nothing else is stored in GitHub.
+- **Three variables:** `PANTHEON_SITE`, `SLACK_CHANNEL`, `WORKFLOW_SKIP_TERMINUS`.
+- **The callers,** installed and kept current by `composer require square360/pantheon-github-workflows`.
 
-## Setup Instructions
+## PR labels the workflows read
 
-### 1. Repository Setup
-
-1. Create a new repository named `shared-pantheon-workflows` in your organization
-2. Copy the workflow files from this repository to `.github/workflows/`
-3. Update your project repositories to use these shared workflows
-
-### 2. Required Secrets
-Each project using these workflows needs these secrets configured:
-- `PANTHEON_SSH_KEY`: SSH key for Pantheon access
-- `PANTHEON_MACHINE_TOKEN`: Pantheon machine token
-- `CI_GH_TOKEN`: GitHub token for semantic release (optional)
-
-### 3. Required Variables
-- `PANTHEON_SITE`: Your Pantheon site name
+`--run-vrt`, `--run-security` (opt-in scans), `--skip-multidev`, `--docs-only` (skip the build). Any other label is ignored. `approved`, `needs review`, `released` are lifecycle labels for humans.
 
 ## Semantic Release Configuration
 
@@ -124,15 +94,7 @@ feat!: change API response format
 
 ## Versioning
 
-We recommend pinning to specific versions for production use:
-```yaml
-uses: Square360/shared-pantheon-workflows/.github/workflows/reusable-deploy-pantheon.yml@v1.0.0
-```
-
-For development, you can use the latest version:
-```yaml
-uses: Square360/shared-pantheon-workflows/.github/workflows/reusable-deploy-pantheon.yml@main
-```
+Releases are cut by semantic-release on every merge to `main`; the `v4` moving major tag follows the newest 4.x release (`major-tag.yml`). Callers reference `@v4`. Pin a full tag (`@v4.10.2`) only when a repo must stay behind deliberately, and record why in the caller.
 
 ## Contributing
 
