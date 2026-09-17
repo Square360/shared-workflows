@@ -5,10 +5,15 @@ Thank you for your interest in contributing to our shared workflows!
 ## Development Process
 
 1. **Fork the repository** and create a feature branch
-2. **Make your changes** following our coding standards
-3. **Test thoroughly** in a development environment
-4. **Create a pull request** with a clear description
-5. **Wait for review** from the maintainers
+2. **Find the callers before you edit.** Two workflows can carry the same step names; only one is live. Check which file the fleet actually calls and where it is referenced inside this repo:
+   ```
+   grep -rl "reusable-<name>.yml" ../*/.github/workflows .github/workflows
+   ```
+   Zero hits means the file is dead, not that it is safe to leave alone. Nested calls between this repo's workflows use the `@v4` moving tag, never a commit SHA — a SHA pin freezes that job at an old release and later fixes never reach a client build.
+3. **Make your changes** following our coding standards
+4. **Test thoroughly** — point one client repo's caller at your branch ref (`@my-branch`) and run a real deploy; a `docs-only` PR there keeps the RC quiet
+5. **Create a pull request** with a clear description
+6. **Wait for review** from the maintainers
 
 ## Testing Workflows
 
