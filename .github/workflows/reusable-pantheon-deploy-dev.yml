@@ -44,6 +44,11 @@ on:
         required: false
         type: number
         default: 6
+      backup_wait_minutes:
+        description: 'Max minutes to wait for the LIVE backup to appear in backup:info before failing (default: 15). terminus backup:create gives up before a large files archive finishes; the verify step trusts the listing, not the exit code (S360-1076).'
+        required: false
+        type: number
+        default: 15
       run_semantic_release:
         description: 'Whether to run semantic-release before deploying'
         required: false
@@ -128,6 +133,7 @@ jobs:
       env_url: ${{ steps.env_url.outputs.url }}
       error_message: ${{ steps.capture_error.outputs.error_message }}
       failed_step: ${{ steps.capture_error.outputs.failed_step }}
+      backup_seconds: ${{ steps.verify_backup.outputs.backup_seconds }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -207,6 +213,10 @@ jobs:
             echo "needs_backup=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # terminus backup:create waits on the Pantheon workflow but gives up before a
+      # large files archive finishes (TEDCO, 3.6 GB: terminus exited 1 at 2m34s,
+      # Pantheon finished at 3m43s). Its exit code is therefore not the outcome.
+      # Create without failing the job, then verify by listing (S360-1076).
       - name: Create backup on live
         id: create_backup
         if: ${{ steps.last_backup.outputs.needs_backup == 'true' }}
@@ -215,8 +225,45 @@ jobs:
           SITE: ${{ inputs.pantheon_site }}
         run: |
           echo "Creating backup on live (keep-for 30 days)"
+          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           terminus -n env:clear-cache "${SITE}.live"
-          terminus -n backup:create "${SITE}.live" --keep-for=30 --no-interaction --quiet --yes
+          if terminus -n backup:create "${SITE}.live" --keep-for=30 --no-interaction --quiet --yes; then
+            echo "terminus reported the backup complete"
+          else
+            echo "::notice::terminus backup:create exited non-zero (rc=$?) — usually it stopped waiting before Pantheon finished. Verifying by listing."
+          fi
+
+      - name: Verify backup on live
+        id: verify_backup
+        if: ${{ steps.last_backup.outputs.needs_backup == 'true' }}
+        env:
+          TERMINUS_MACHINE_TOKEN: ${{ env.PANTHEON_MACHINE_TOKEN }}
+          SITE: ${{ inputs.pantheon_site }}
+          START: ${{ steps.create_backup.outputs.start_epoch }}
+          WAIT_MINUTES: ${{ inputs.backup_wait_minutes }}
+        run: |
+          # A backup is real when BOTH the database and files elements list a backup
+          # dated at or after this run's start. Poll every 20s up to backup_wait_minutes;
+          # fail only if it never appears.
+          deadline=$(( START + WAIT_MINUTES * 60 ))
+          while :; do
+            db=$(terminus backup:info "${SITE}.live" --element=database --format=list --field=date 2>/dev/null || echo 0)
+            files=$(terminus backup:info "${SITE}.live" --element=files --format=list --field=date 2>/dev/null || echo 0)
+            db=${db%%.*}; files=${files%%.*}
+            now=$(date +%s)
+            if [[ "${db:-0}" -ge "$START" && "${files:-0}" -ge "$START" ]]; then
+              took=$(( now - START ))
+              printf 'backup verified: database %s, files %s — took %dm%02ds\n' "$(date -u -d @"$db" +%H:%M:%S)" "$(date -u -d @"$files" +%H:%M:%S)" $((took/60)) $((took%60))
+              echo "backup_seconds=${took}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            if [[ "$now" -ge "$deadline" ]]; then
+              echo "::error::No LIVE backup newer than the step start appeared within ${WAIT_MINUTES} minutes (database=${db:-none}, files=${files:-none}, start=${START})."
+              exit 1
+            fi
+            echo "waiting for backup… (db=${db:-none} files=${files:-none}, $(( (deadline - now) / 60 ))m left)"
+            sleep 20
+          done
 
       - name: Run post-deploy drush commands
         id: drush_commands
@@ -251,6 +298,9 @@ jobs:
           elif [[ "${{ steps.create_backup.conclusion }}" == "failure" ]]; then
             echo "failed_step=Backup Creation" >> "$GITHUB_OUTPUT"
             echo "error_message=Failed to create backup on live." >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.verify_backup.conclusion }}" == "failure" ]]; then
+            echo "failed_step=Backup Verification" >> "$GITHUB_OUTPUT"
+            echo "error_message=No new LIVE backup appeared within ${{ inputs.backup_wait_minutes }} minutes. Check the Pantheon workflow log for the backup and re-run once it exists." >> "$GITHUB_OUTPUT"
           elif [[ "${{ steps.drush_commands.conclusion }}" == "failure" ]]; then
             echo "failed_step=Drush Commands" >> "$GITHUB_OUTPUT"
             echo "error_message=Failed to run drush updb/cim/cr on dev." >> "$GITHUB_OUTPUT"
@@ -291,6 +341,7 @@ jobs:
           ENV_URL: ${{ needs.deploy_to_pantheon_dev.outputs.env_url }}
           FAILED_STEP: ${{ needs.deploy_to_pantheon_dev.outputs.failed_step }}
           ERROR_MESSAGE: ${{ needs.deploy_to_pantheon_dev.outputs.error_message }}
+          BACKUP_SECONDS: ${{ needs.deploy_to_pantheon_dev.outputs.backup_seconds }}
           REPO: ${{ github.repository }}
           SITE: ${{ inputs.pantheon_site }}
           RUN_ID: ${{ github.run_id }}
@@ -324,6 +375,12 @@ jobs:
             ENV_URL_FIELD=",{\"title\": \"Environment URL\", \"value\": \"<${ENV_URL}|${ENV_URL}>\", \"short\": false}"
           fi
 
+          # Backup duration on success (S360-1076) — slow sites become visible.
+          BACKUP_FIELD=""
+          if [[ "$DEPLOY_RESULT" == "success" && -n "$BACKUP_SECONDS" ]]; then
+            BACKUP_FIELD=",{\"title\": \"LIVE backup\", \"value\": \"took $((BACKUP_SECONDS/60))m$((BACKUP_SECONDS%60))s\", \"short\": true}"
+          fi
+
           ERROR_FIELD=""
           if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
             FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
@@ -348,7 +405,7 @@ jobs:
                     {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
                     {\"title\": \"Phase\", \"value\": \"${PHASE}\", \"short\": true},
                     {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
-                    ${ENV_URL_FIELD}
+                    ${ENV_URL_FIELD}${BACKUP_FIELD}
                     ${ERROR_FIELD}
                   ],
                   \"footer\": \"GitHub Actions\",
