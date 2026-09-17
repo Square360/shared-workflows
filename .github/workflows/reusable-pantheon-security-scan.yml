@@ -5,8 +5,10 @@ name: Reusable Security Scan (OWASP ZAP Baseline)
 #
 # Runs an OWASP ZAP baseline scan against a deployed Pantheon multidev. Uploads
 # HTML + JSON + Markdown reports to the same S3 bucket VRT uses (new prefix
-# /security/) and posts a summary to the PR, an optional ClickUp task, and an
-# optional Slack channel.
+# /security/) and posts a summary to the PR, the GitHub job summary, and an
+# optional Slack channel. The ClickUp task comment is opt-in (clickup_comment:
+# true) — off by default since 2026-09-16 (S360-1077): one comment per RC build
+# swamped release tickets, and the run page + Slack already carry the result.
 #
 # Gating:
 #   - pr-*  multidevs: opt-in via [run-security], [run-security TASK-ID],
@@ -53,6 +55,11 @@ on:
         required: false
         type: string
         default: ''
+      clickup_comment:
+        description: 'Post the scan summary as a comment on the resolved ClickUp task. Default false — the job summary and Slack carry the result (S360-1077).'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -577,6 +584,43 @@ jobs:
     # -------------------------------------------------------------------------
     # Post the summary to the PR (matches VRT comment style).
     # -------------------------------------------------------------------------
+    # Job summary — the run page is the canonical place to read the result
+    # (S360-1077). Same content as the PR comment; no external write.
+    - name: Write job summary
+      if: steps.sec_check.outputs.enabled == 'true'
+      env:
+        REPORT_HTML_URL: ${{ steps.s3_upload.outputs.report_html_url }}
+        REPORT_JSON_URL: ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:      ${{ inputs.target_env }}
+        TARGET_URL:      ${{ steps.get_url.outputs.target_url }}
+        HIGH:            ${{ steps.summarise.outputs.high }}
+        MEDIUM:          ${{ steps.summarise.outputs.medium }}
+        LOW:             ${{ steps.summarise.outputs.low }}
+        INFO:            ${{ steps.summarise.outputs.info }}
+        TOTAL:           ${{ steps.summarise.outputs.total }}
+        SEVERITY_MODE:   ${{ steps.sec_check.outputs.severity_mode }}
+        SCAN_STATUS:     ${{ steps.summarise.outputs.scan_status }}
+      run: |
+        if   [[ "$SCAN_STATUS" == "inconclusive" ]];   then ICON="⚠️"; TEXT="Scan inconclusive — target was not reachable during the scan"
+        elif [[ "$SCAN_STATUS" == "missing_report" ]]; then ICON="⚠️"; TEXT="Scan inconclusive — ZAP produced no report"
+        elif [[ "${TOTAL:-0}" -eq 0 ]];                then ICON="✅"; TEXT="No findings"
+        elif [[ "${HIGH:-0}" -gt 0 && "$SEVERITY_MODE" == "strict" ]]; then ICON="❌"; TEXT="${HIGH} High severity finding(s) — release candidate gate failed"
+        elif [[ "${HIGH:-0}" -gt 0 ]];                 then ICON="⚠️"; TEXT="${HIGH} High severity finding(s) — review before merge"
+        else                                                ICON="ℹ️"; TEXT="${TOTAL} finding(s) — informational"
+        fi
+        {
+          echo "## ${ICON} OWASP ZAP Baseline Scan — ${TEXT}"
+          echo
+          echo "**High:** ${HIGH:-0} · **Medium:** ${MEDIUM:-0} · **Low:** ${LOW:-0} · **Info:** ${INFO:-0}"
+          echo
+          if [[ -s zap-summary.md ]]; then cat zap-summary.md; else echo "_No summary available._"; fi
+          echo
+          [[ -n "$REPORT_HTML_URL" ]] && echo "[📊 View Full HTML Report](${REPORT_HTML_URL})"
+          [[ -n "$REPORT_JSON_URL" ]] && echo "[🤖 AI-readable JSON report](${REPORT_JSON_URL})"
+          echo
+          echo "> Target: \`${TARGET_ENV}\` — ${TARGET_URL}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Comment on PR
       if: steps.sec_check.outputs.enabled == 'true' && github.event.pull_request.number != ''
       uses: actions/github-script@v8
@@ -652,6 +696,7 @@ jobs:
     # -------------------------------------------------------------------------
     - name: Comment on ClickUp task
       if: >
+        inputs.clickup_comment == true &&
         steps.sec_check.outputs.enabled == 'true' &&
         steps.sec_check.outputs.clickup_task_id != ''
       continue-on-error: true

@@ -177,6 +177,25 @@ jobs:
           # Wake the environment (idle multidevs 502 the first request).
           terminus env:wake "$SITE.$TARGET_ENV" >/dev/null 2>&1 || true
 
+          # Self-unban. Sites running s360_security_core/advban carry a ban
+          # table in every cloned multidev DB, and hundreds of those rows are
+          # /24 ranges inside Microsoft space — which is where GitHub-hosted
+          # runners live. A runner that draws a banned address gets a 403 on
+          # EVERY route, including the anonymous baseline, before Drupal even
+          # routes (NJ211 rc-2026-38, 2026-09-16: 254 active range bans inside
+          # api.github.com/meta "actions"). Drop any ban covering this runner
+          # first; harmless on sites without the module (command unknown).
+          EGRESS_IP=$(curl -s --max-time 10 https://api.ipify.org || curl -s --max-time 10 https://ifconfig.me || true)
+          if [[ -n "$EGRESS_IP" ]]; then
+            echo "Runner egress IP: $EGRESS_IP"
+            UNBAN_OUT=$(terminus drush "$SITE.$TARGET_ENV" -- s360:security:unban "$EGRESS_IP" 2>&1 || true)
+            if echo "$UNBAN_OUT" | grep -qi "unbanned"; then
+              echo "::warning::Runner IP $EGRESS_IP was banned on $SITE.$TARGET_ENV and has been unbanned for this run. Scanners share Microsoft ranges with GitHub runners — this is expected, not a site fault."
+            elif echo "$UNBAN_OUT" | grep -qiE "not defined|command .* not found|Unknown command"; then
+              echo "s360_security_core not on this site; skipping self-unban."
+            fi
+          fi
+
           # One-time login link → session cookie. The link is a credential:
           # mask it before anything can echo it. NOTE: uid 1 is blocked on
           # hardened sites — pass uli_options: '--name=<account>' there; the
@@ -212,6 +231,14 @@ jobs:
           LANDED=$(curl -s -o /dev/null -w '%{url_effective}' -L --max-time 30 "${CURL_AUTH[@]}" -c "$JAR" -b "$JAR" "$TARGET_URL/user")
           if [[ "$LANDED" == *"/user/login"* ]]; then
             echo "::error::uli login did not stick — /user bounced to the login page"
+            exit 1
+          fi
+          # A banned runner gets a bare 403 "<ip> has been banned" from the
+          # advban middleware on every URL — name that instead of letting it
+          # surface as eleven per-route 403s.
+          BODY=$(curl -s --max-time 30 "${CURL_AUTH[@]}" -c "$JAR" -b "$JAR" "$TARGET_URL/user")
+          if echo "$BODY" | grep -qi "has been banned"; then
+            echo "::error::Runner IP is BANNED on $SITE.$TARGET_ENV (advban): \"$(echo "$BODY" | head -c 120)\". Self-unban did not clear it — check that s360_security_core is enabled and the drush command runs there."
             exit 1
           fi
 

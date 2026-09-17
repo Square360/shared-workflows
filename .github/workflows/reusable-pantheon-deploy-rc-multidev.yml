@@ -3,6 +3,8 @@ name: Reusable Deploy to RC Multidev (Pantheon)
 # -----------------------------------------------------------------------------
 # Deploys the develop branch to a Pantheon multidev named rc-<YYYY>-<WW> (ISO
 # year and week). Triggered on the consumer side by pushes/merges to develop.
+# Only real merges deploy: closed PRs with merged_by:null (GitHub-inferred merges
+# of subset PRs) are skipped, and deploys serialise per site (S360-1079).
 # Multiple merges in the same ISO week share the same multidev.
 #
 # Defaults:
@@ -66,6 +68,11 @@ on:
         required: false
         type: string
         default: 'high'
+      clickup_comment:
+        description: 'Forwarded to the VRT and security-scan jobs: post their summaries to the resolved ClickUp task. Default false (S360-1077).'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -81,11 +88,23 @@ jobs:
     # Skip when the merged PR is docs or developer tooling (--docs-only /
     # --skip-multidev labels, or the legacy body tags). Downstream jobs `needs`
     # this one and skip with it; notify_slack reports the skip.
+    # merged_by guard (S360-1079, #140): a PR GitHub auto-closes because its
+    # commits landed through another PR is merged:true with merged_by:null. It
+    # carries no new code and must not start a second RC deploy that races the
+    # real one. Null-safe for the push wiring (no PR payload).
     if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.merged_by != null) &&
       !contains(github.event.pull_request.labels.*.name, '--docs-only') &&
       !contains(github.event.pull_request.labels.*.name, '--skip-multidev') &&
       !contains(github.event.pull_request.body, '[docs-only]') &&
       !contains(github.event.pull_request.body, '[skip-multidev]')
+    # One RC deploy per site at a time. Two merges landing in the same minute
+    # (or a real merge plus an inferred one on an older caller) queue instead of
+    # racing the git push to the same rc-* env; never cancel, the later run may
+    # be the one carrying the new code (S360-1079, #140).
+    concurrency:
+      group: rc-multidev-${{ inputs.pantheon_site }}
+      cancel-in-progress: false
     permissions:
       deployments: write
       contents: write
@@ -199,8 +218,10 @@ jobs:
 
   composer_audit:
     name: Composer security audit (RC gate)
-    # Same skip as the deploy: a docs/tooling merge is not a release candidate.
+    # Same skip as the deploy: a docs/tooling merge is not a release candidate,
+    # and neither is an inferred merge (merged_by:null).
     if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.merged_by != null) &&
       !contains(github.event.pull_request.labels.*.name, '--docs-only') &&
       !contains(github.event.pull_request.labels.*.name, '--skip-multidev') &&
       !contains(github.event.pull_request.body, '[docs-only]') &&
@@ -317,7 +338,7 @@ jobs:
     # .github/smoke-routes.txt.
     if: ${{ inputs.run_route_smoke }}
     needs: deploy_rc_multidev
-    uses: Square360/shared-workflows/.github/workflows/reusable-route-smoke.yml@12edc3ff2b7618d5ee3a5bedb22778894a8aaef8  # v4.8.2 — uli account from ROUTE_SMOKE_ULI_OPTIONS repo/org var
+    uses: Square360/shared-workflows/.github/workflows/reusable-route-smoke.yml@v4  # moving major tag — advances with each 4.x releasent from ROUTE_SMOKE_ULI_OPTIONS repo/org var
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
@@ -335,8 +356,9 @@ jobs:
     if: ${{ !cancelled() && needs.deploy_rc_multidev.result == 'success' && (needs.route_smoke.result == 'success' || needs.route_smoke.result == 'skipped') }}
     # The security workflow detects rc-* internally and runs unconditionally
     # in strict mode (fails on any High-severity finding). No force_run needed.
-    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-security-scan.yml@v4  # moving major tag — advances with each 4.x release
     with:
+      clickup_comment: ${{ inputs.clickup_comment }}
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
       slack_channel: ${{ inputs.slack_channel }}
@@ -363,6 +385,7 @@ jobs:
       }}
     uses: Square360/shared-workflows/.github/workflows/reusable-pantheon-vrt.yml@v4  # moving major tag — advances with each 4.x release
     with:
+      clickup_comment: ${{ inputs.clickup_comment }}
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_rc_multidev.outputs.target_env }}
       slack_channel: ${{ inputs.slack_channel }}
