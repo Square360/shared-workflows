@@ -1,3 +1,16 @@
+# Release 4.11.3 (2026-09-21)
+
+### Bug Fixes
+
+* rc-gate: capture the composer audit payload when it is not JSON (986bde6)
+* (vrt,security-scan): use the org variable names as created - S3_BUCKET / S3_REGION (347edef)
+* (vrt,security-scan): read the S3 bucket and region from org variables so the job summary renders the report link (0f4c4a7)
+
+### Documentation
+
+* finish genericising the bucket name in the policy examples (94a5c01)
+* stop naming a bucket that is not ours in the AWS setup guide (2d7db84)
+
 # Release 4.11.2 (2026-09-21)
 
 ### Documentation
