@@ -263,13 +263,13 @@ jobs:
       id: s3_urls
       if: steps.vrt_check.outputs.enabled == 'true'
       env:
-        AWS_S3_BUCKET:       ${{ vars.AWS_S3_BUCKET }}
-        AWS_S3_REGION_INPUT: ${{ vars.AWS_S3_REGION }}
+        AWS_S3_BUCKET:       ${{ vars.S3_BUCKET }}
+        AWS_S3_REGION_INPUT: ${{ vars.S3_REGION }}
         PANTHEON_SITE:       ${{ inputs.pantheon_site }}
       run: |
         REGION="${AWS_S3_REGION_INPUT:-us-east-1}"
         if [[ -z "$AWS_S3_BUCKET" ]]; then
-          echo "::error::AWS_S3_BUCKET is empty - set the org Actions variable AWS_S3_BUCKET to the reports bucket name."
+          echo "::error::AWS_S3_BUCKET is empty - set the org Actions variable S3_BUCKET to the reports bucket name."
           exit 1
         fi
         RUN_KEY="${{ inputs.target_env }}-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -812,8 +812,8 @@ jobs:
       env:
         AWS_ACCESS_KEY_ID:     ${{ env.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
-        AWS_S3_BUCKET:         ${{ vars.AWS_S3_BUCKET }}
-        AWS_S3_REGION_INPUT:   ${{ vars.AWS_S3_REGION }}
+        AWS_S3_BUCKET:         ${{ vars.S3_BUCKET }}
+        AWS_S3_REGION_INPUT:   ${{ vars.S3_REGION }}
         PANTHEON_SITE:         ${{ inputs.pantheon_site }}
       run: |
         AWS_DEFAULT_REGION="${AWS_S3_REGION_INPUT:-us-east-1}"

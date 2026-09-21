@@ -44,8 +44,8 @@ PR merged to develop
 - `PANTHEON_MACHINE_TOKEN` (required) — to get LIVE URL via Terminus
 - `AWS_ACCESS_KEY_ID` (required)
 - `AWS_SECRET_ACCESS_KEY` (required)
-- `AWS_S3_BUCKET` (required) — bucket name; org Actions **variable**, never a secret (see VRT-AWS-SETUP.md)
-- `AWS_S3_REGION` (optional, default `us-east-1`); org Actions variable
+- `S3_BUCKET` (required) — bucket name; org Actions **variable**, never a secret (see VRT-AWS-SETUP.md)
+- `S3_REGION` (optional, default `us-east-1`); org Actions variable
 - `CLICKUP_API_TOKEN` (optional) — required only when posting results to a ClickUp task
 
 **Steps:**
@@ -161,7 +161,7 @@ s3://your-vrt-bucket/
 ```
 
 3. Bucket policy: make `*/report.html` and `*/diff/*` publicly readable so PR comment links work without signing.
-4. Store the IAM access key + secret in 1Password (`op://s360-cicd/aws-ci`); set `AWS_S3_BUCKET` and `AWS_S3_REGION` as org Actions variables
+4. Store the IAM access key + secret in 1Password (`op://s360-cicd/aws-ci`); set `S3_BUCKET` and `S3_REGION` as org Actions variables
 
 ### Playwright Script
 

@@ -7,7 +7,7 @@ Everything that needs to be created/configured in AWS to support the Visual Regr
 ## 1. S3 Bucket
 
 - [x] Create bucket (the live one is the value of `op://s360-cicd/aws-ci/s3-bucket`)
-- [x] Region: `us-east-1` (or set `AWS_S3_REGION` secret if different)
+- [x] Region: `us-east-1` (or set `S3_REGION` secret if different)
 - [x] Block public access: **off** for the bucket (required for public report links)
 - [x] Versioning: not required
 - [x] Object ownership: ACLs disabled (use bucket policy for public access)
@@ -82,8 +82,8 @@ The bucket and region are **org-level GitHub Actions variables**, not secrets:
 
 | Variable name | Value |
 |---|---|
-| `AWS_S3_BUCKET` | Bucket name — the value of `op://s360-cicd/aws-ci/s3-bucket` |
-| `AWS_S3_REGION` | Region, e.g. `us-east-1` (optional — defaults to `us-east-1`) |
+| `S3_BUCKET` | Bucket name — the value of `op://s360-cicd/aws-ci/s3-bucket` |
+| `S3_REGION` | Region, e.g. `us-east-1` (optional — defaults to `us-east-1`) |
 
 They are variables rather than secrets on purpose. Anything resolved through
 1Password is registered with `core.setSecret()`, and the runner then scrubs that
