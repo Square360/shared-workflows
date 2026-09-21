@@ -26,8 +26,8 @@ Attach the following bucket policy to allow public read on reports and diffs onl
       "Principal": "*",
       "Action": "s3:GetObject",
       "Resource": [
-        "arn:aws:s3:::square360-vrt-reports/*/report.html",
-        "arn:aws:s3:::square360-vrt-reports/*/diff/*"
+        "arn:aws:s3:::<bucket>/*/report.html",
+        "arn:aws:s3:::<bucket>/*/diff/*"
       ]
     }
   ]
@@ -56,8 +56,8 @@ Attach the following bucket policy to allow public read on reports and diffs onl
         "s3:ListBucket"
       ],
       "Resource": [
-        "arn:aws:s3:::square360-vrt-reports",
-        "arn:aws:s3:::square360-vrt-reports/*"
+        "arn:aws:s3:::<bucket>",
+        "arn:aws:s3:::<bucket>/*"
       ]
     }
   ]
@@ -103,5 +103,5 @@ public-read by design so the report links work.
     aws s3 cp test.html s3://<bucket>/test/report.html
   ```
 - [x] Confirm the file is publicly accessible at:
-  `https://square360-vrt-reports.s3.amazonaws.com/test/report.html`
+  `https://<bucket>.s3.amazonaws.com/test/report.html`
 - [ ] Delete the test file when done (requires `s3:DeleteObject` permission — delete manually via AWS console)

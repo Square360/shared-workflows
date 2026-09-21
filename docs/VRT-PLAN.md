@@ -143,7 +143,7 @@ s3://your-vrt-bucket/
 
 ### IAM Setup (one-time, you create in AWS Console)
 
-1. Create S3 bucket: `square360-vrt-reports` (or similar)
+1. Create S3 bucket: `<bucket>` (or similar)
 2. Create IAM user `github-vrt-bot` with inline policy:
 
 ```json
@@ -153,8 +153,8 @@ s3://your-vrt-bucket/
     "Effect": "Allow",
     "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
     "Resource": [
-      "arn:aws:s3:::square360-vrt-reports",
-      "arn:aws:s3:::square360-vrt-reports/*"
+      "arn:aws:s3:::<bucket>",
+      "arn:aws:s3:::<bucket>/*"
     ]
   }]
 }
