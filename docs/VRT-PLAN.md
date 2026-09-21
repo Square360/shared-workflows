@@ -99,7 +99,7 @@ vrt:
   threshold: 0.05        # Max acceptable diff ratio (0.0–1.0); default 0.05
   fail_on_diff: false    # Whether to fail the workflow job on threshold breach
   wait: 6                # Default seconds to wait after networkidle before screenshotting; default 6
-  bypass_header: x-pantheon-bot-bypass  # Header carrying the site's AGCDN bot-bypass token (token lives in 1Password: s360-cicd/pantheon-bot-bypass/<site>); default shown
+  bypass_header: x-pantheon-bot-bypass  # Override only. The token and its header name are read in-flow from `terminus gcdn:bot-bypass`; default shown
   viewports:
     - width: 1440
       height: 900

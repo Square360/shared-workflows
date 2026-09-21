@@ -1,0 +1,22 @@
+# Release-prep configuration — team-shared. The release-prep skill reads this
+# file (it wins over any operator-side registry). Schema + procedure:
+# Copilot-Drupal-Instructions/skills/release-prep/SKILL.md
+# First run 2026-09-16 (S360-1080). This repo is the shared CI library, not a
+# Drupal site: no Pantheon environment, no sprint rotation, no drush deploy.
+github:
+  owner: Square360
+  repo: shared-workflows
+  target_branch: main             # default branch; semantic-release cuts a 4.x tag on every merge
+  release_label: "approved"       # pre-existing label
+  pr_merge_style: merge           # main history shows merge commits between the release chores
+clickup:
+  space_id: "54084396"            # S360 (Square360 internal) space
+  sprint_list_pattern: null       # fixed list — no sprint rotation
+  list_id: "206861778"            # "S360 Maintenance and ongoing tasks"
+  deploy_status: "to deploy"      # lowercase — EXACT case ClickUp returns
+ci_runs_drush_deploy: false       # not a Drupal site; no drush anywhere in this repo's own CI
+pantheon_site: null               # no Pantheon env — Step 5c hygiene audit self-skips
+slack_channel: null               # internal repo; no client channel. Releases announce via the semantic-release GitHub Release.
+# Convention: every release on this repo gets its own ClickUp release ticket with the
+# in-scope work tickets linked to it (S360-1080 is the first). Step 9a uses linked_tasks
+# as the primary detection signal and cross-checks against the status filter.

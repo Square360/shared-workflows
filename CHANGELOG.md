@@ -1,3 +1,27 @@
+# Release 4.11.1 (2026-09-21)
+
+### Bug Fixes
+
+* vrt: read the bot-bypass token from Terminus so a missing 1Password field stops killing VRT (2898532)
+
+# Release 4.11.0 (2026-09-17)
+
+### Features
+
+* S360-1077: ZAP + VRT write their results to the GitHub job summary; ClickUp comments opt-in (5c5b8f3)
+
+### Bug Fixes
+
+* S360-1082: call reusable-route-smoke from the multidev workflows at the v4 moving tag (was the v4.8.2 SHA), so the advban self-unban fix reaches RC builds (7b38e14)
+* S360-1076: port the backup verify-by-listing to reusable-pantheon-deploy-dev.yml, the workflow the fleet actually calls (74a7051)
+* rc-multidev: skip GitHub-inferred merges and serialise RC deploys per site (b23ce20)
+* S360-1076: verify the LIVE backup by listing instead of trusting terminus's exit code (27a966f)
+* route-smoke: unban the runner's egress IP before checking routes (9913f17)
+
+### Documentation
+
+* release-prep config for this repo (first run, S360-1080) (9a32e96)
+
 # Release 4.10.2 (2026-09-16)
 
 ### Bug Fixes

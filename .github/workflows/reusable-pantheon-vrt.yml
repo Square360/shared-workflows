@@ -25,6 +25,13 @@ on:
         required: false
         type: string
         default: ''
+      # Off by default since 2026-09-16 (S360-1077): the run page (job summary)
+      # and Slack carry the result; per-build ClickUp comments swamped release tickets.
+      clickup_comment:
+        description: 'Post the VRT summary as a comment on the resolved ClickUp task. Default false.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -166,22 +173,6 @@ jobs:
         CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
         SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
 
-    # Optional per-site bot-bypass token. Pantheon's AGCDN (Cloudflare) serves a
-    # JS challenge to headless Chrome, which never reaches networkidle, so every
-    # screenshot times out (TEDCO rc-2026-38, 2026-09-16: 30/30 timeouts). Sites
-    # behind the challenge store their bypass token as a field named after the
-    # site machine name on the s360-cicd "pantheon-bot-bypass" item. Missing
-    # field = step fails softly and VRT runs without the header, as before.
-    - name: Load bot-bypass token (optional)
-      id: bot_bypass
-      if: steps.vrt_check.outputs.enabled == 'true'
-      continue-on-error: true
-      uses: 1password/load-secrets-action@v5
-      with:
-        export-env: true
-      env:
-        BOT_BYPASS_TOKEN: op://s360-cicd/pantheon-bot-bypass/${{ inputs.pantheon_site }}
-
     - name: Install Terminus
       if: steps.vrt_check.outputs.enabled == 'true'
       env:
@@ -192,6 +183,54 @@ jobs:
           -o /usr/local/bin/terminus
         chmod +x /usr/local/bin/terminus
         terminus auth:login --machine-token="$TERMINUS_MACHINE_TOKEN"
+
+    # Bot-bypass token for Pantheon's new Cloudflare GCDN, which is replacing
+    # Fastly. Cloudflare serves a JS challenge to headless Chrome, which never
+    # reaches networkidle, so every screenshot times out (TEDCO rc-2026-38,
+    # 2026-09-16: 30/30 timeouts).
+    #
+    # Pantheon mints the token per site, so it is read in-flow from Terminus
+    # rather than mirrored into 1Password: nothing to register when a site moves
+    # off Fastly, and the 2026-12-01 rotation is picked up on its own. Sites
+    # still on Fastly are issued a token too and get the header as well; an
+    # unrecognised request header is ignored, which is cheaper than probing the
+    # CDN on every run.
+    #
+    # Soft by construction. Every failure path here leaves the token empty and
+    # VRT runs without the header, as it did before v4.10.2 — the missing-field
+    # path in that release took the whole job down with it (issue #151), so this
+    # step touches nothing but its own outputs and never exports to the job env.
+    - name: Load bot-bypass token
+      id: bot_bypass
+      if: steps.vrt_check.outputs.enabled == 'true'
+      env:
+        PANTHEON_SITE: ${{ inputs.pantheon_site }}
+      run: |
+        TOKEN=""
+        HEADER=""
+
+        # The gcdn commands ship as a plugin, not in the phar.
+        if terminus self:plugin:install pantheon-systems/terminus-gcdn-plugin --yes >/dev/null 2>&1; then
+          JSON=$(terminus gcdn:bot-bypass "$PANTHEON_SITE" --format=json 2>/dev/null) || JSON=""
+          if [[ -n "$JSON" ]]; then
+            FILTER='(if type == "object" then [.[]] else . end)
+                    | map(select(.role == "current")) | .[0]'
+            TOKEN=$(jq -r "${FILTER} | .token // empty"       <<< "$JSON" 2>/dev/null) || TOKEN=""
+            HEADER=$(jq -r "${FILTER} | .header_name // empty" <<< "$JSON" 2>/dev/null) || HEADER=""
+          fi
+        fi
+
+        if [[ -n "$TOKEN" ]]; then
+          echo "::add-mask::${TOKEN}"
+          echo "Bot bypass: token retrieved for ${PANTHEON_SITE}"
+        else
+          echo "Bot bypass: no token for ${PANTHEON_SITE} - VRT runs without the header"
+        fi
+
+        {
+          echo "token=${TOKEN}"
+          echo "header=${HEADER}"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Get site URLs
       id: get_urls
@@ -269,7 +308,8 @@ jobs:
         const TARGET_ENV      = process.env.TARGET_ENV || '';
         const PANTHEON_SITE   = process.env.PANTHEON_SITE || '';
         const EXTRA_PAGES_RAW = process.env.EXTRA_PAGES || '';
-        const BOT_BYPASS_TOKEN = process.env.BOT_BYPASS_TOKEN || '';
+        const BOT_BYPASS_TOKEN  = process.env.BOT_BYPASS_TOKEN || '';
+        const BOT_BYPASS_HEADER = process.env.BOT_BYPASS_HEADER || '';
         const RUN_ID          = process.env.GITHUB_RUN_ID || 'local';
         const RUN_ATTEMPT     = process.env.GITHUB_RUN_ATTEMPT || '1';
         const REPO            = process.env.GITHUB_REPO || '';
@@ -313,7 +353,7 @@ jobs:
         const defaultWait = config.vrt?.wait         ?? 6;
         const viewports   = config.vrt?.viewports    ?? DEFAULT_CONFIG.vrt.viewports;
         const pages       = [...(config.vrt?.pages   ?? DEFAULT_CONFIG.vrt.pages)];
-        const bypassHeader = config.vrt?.bypass_header ?? 'x-pantheon-bot-bypass';
+        const bypassHeader = config.vrt?.bypass_header || BOT_BYPASS_HEADER || 'x-pantheon-bot-bypass';
         const extraHeaders = BOT_BYPASS_TOKEN ? { [bypassHeader]: BOT_BYPASS_TOKEN } : {};
         console.log(`Bot bypass: ${BOT_BYPASS_TOKEN ? `header ${bypassHeader} set` : 'none (no token for this site)'}`);
 
@@ -752,7 +792,8 @@ jobs:
         TARGET_ENV:         ${{ inputs.target_env }}
         PANTHEON_SITE:      ${{ inputs.pantheon_site }}
         EXTRA_PAGES:        ${{ steps.vrt_check.outputs.extra_pages }}
-        BOT_BYPASS_TOKEN:   ${{ env.BOT_BYPASS_TOKEN }}
+        BOT_BYPASS_TOKEN:   ${{ steps.bot_bypass.outputs.token }}
+        BOT_BYPASS_HEADER:  ${{ steps.bot_bypass.outputs.header }}
         GITHUB_RUN_ID:      ${{ github.run_id }}
         GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         GITHUB_REPO:        ${{ github.repository }}
@@ -848,8 +889,39 @@ jobs:
 
     # Post VRT results to the ClickUp task identified from [vrt TASK-ID] or branch name.
     # Skipped gracefully if CLICKUP_API_TOKEN / CLICKUP_TEAM_ID are not configured.
+    # Job summary — same table as the PR comment, on the run page (S360-1077).
+    - name: Write job summary
+      if: steps.vrt_check.outputs.enabled == 'true' && steps.run_vrt.conclusion == 'success'
+      env:
+        REPORT_URL:       ${{ steps.s3_upload.outputs.report_url }}
+        REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
+        TARGET_ENV:       ${{ inputs.target_env }}
+        MULTIDEV_URL:     ${{ steps.get_urls.outputs.rc_url }}
+      run: |
+        node -e '
+          const fs = require("fs");
+          const s  = JSON.parse(fs.readFileSync("vrt-summary.json", "utf8"));
+          const icon = s.allPassed ? "✅" : "❌";
+          const text = s.allPassed ? "All checks passed" : "Some checks failed";
+          const rows = s.results.map(r => {
+            const i = r.error ? "⚠️" : (r.passed ? "✅" : "❌");
+            const d = r.error ? "Error" : `${r.diffPercent}%`;
+            return `| ${i} | ${r.page} | \`${r.path}\` | ${r.viewport} | ${d} |`;
+          }).join("\n");
+          const out = [
+            `## ${icon} Visual Regression Test — ${text}`, "",
+            `**${s.passCount} passed, ${s.failCount} failed** · Threshold: ${s.thresholdPercent}%`, "",
+            "| | Page | Path | Viewport | Diff |", "|:---:|---|---|---|---|", rows, "",
+            process.env.REPORT_URL ? `[📊 View Full Report with Screenshots](${process.env.REPORT_URL})` : "",
+            process.env.REPORT_JSON_URL ? `[🤖 AI-readable JSON report](${process.env.REPORT_JSON_URL})` : "", "",
+            `> Multidev: \`${process.env.TARGET_ENV}\` — ${process.env.MULTIDEV_URL}`, "",
+          ].filter(l => l !== null && l !== undefined).join("\n");
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out);
+        '
+
     - name: Comment on ClickUp task
       if: >
+        inputs.clickup_comment == true &&
         steps.vrt_check.outputs.enabled == 'true' &&
         steps.run_vrt.conclusion == 'success' &&
         steps.vrt_check.outputs.clickup_task_id != ''
