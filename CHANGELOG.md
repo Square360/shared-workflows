@@ -1,3 +1,13 @@
+# Release 4.11.2 (2026-09-21)
+
+### Documentation
+
+* contributing: find the callers before editing a reusable; nested calls use @v4, never a SHA; test via a client caller pointed at the branch (4389a4c)
+
+### Chores
+
+* remove the deprecated monolithic workflows, unreferenced variants, stale examples and finished plans; rewrite README to the v4 layout (5c6613f)
+
 # Release 4.11.1 (2026-09-21)
 
 ### Bug Fixes
