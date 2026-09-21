@@ -1,3 +1,9 @@
+# Release 4.11.1 (2026-09-21)
+
+### Bug Fixes
+
+* vrt: read the bot-bypass token from Terminus so a missing 1Password field stops killing VRT (2898532)
+
 # Release 4.11.0 (2026-09-17)
 
 ### Features
