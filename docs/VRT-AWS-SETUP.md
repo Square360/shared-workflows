@@ -6,7 +6,7 @@ Everything that needs to be created/configured in AWS to support the Visual Regr
 
 ## 1. S3 Bucket
 
-- [x] Create bucket: `square360-vrt-reports` (or your preferred name)
+- [x] Create bucket (the live one is the value of `op://s360-cicd/aws-ci/s3-bucket`)
 - [x] Region: `us-east-1` (or set `AWS_S3_REGION` secret if different)
 - [x] Block public access: **off** for the bucket (required for public report links)
 - [x] Versioning: not required
@@ -82,7 +82,7 @@ The bucket and region are **org-level GitHub Actions variables**, not secrets:
 
 | Variable name | Value |
 |---|---|
-| `AWS_S3_BUCKET` | Bucket name, e.g. `square360-vrt-reports` |
+| `AWS_S3_BUCKET` | Bucket name — the value of `op://s360-cicd/aws-ci/s3-bucket` |
 | `AWS_S3_REGION` | Region, e.g. `us-east-1` (optional — defaults to `us-east-1`) |
 
 They are variables rather than secrets on purpose. Anything resolved through
@@ -100,7 +100,7 @@ public-read by design so the report links work.
 - [x] Upload a test file to the bucket using the IAM credentials to confirm write access:
   ```bash
   AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=yyy \
-    aws s3 cp test.html s3://square360-vrt-reports/test/report.html
+    aws s3 cp test.html s3://<bucket>/test/report.html
   ```
 - [x] Confirm the file is publicly accessible at:
   `https://square360-vrt-reports.s3.amazonaws.com/test/report.html`
