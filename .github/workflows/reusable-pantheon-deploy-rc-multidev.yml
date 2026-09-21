@@ -270,6 +270,27 @@ jobs:
             echo "::error::composer audit produced no JSON (exit $AUDIT_EXIT)"; cat composer-audit.err; exit 1
           fi
 
+          # Validate before extracting (issue #150). A non-JSON payload used to
+          # surface as a bare "jq: parse error" with neither stream in the log:
+          # stdout went to the file and the cat of stderr above only fires on the
+          # empty-file branch. Dump the payload as bytes, not just text - the
+          # observed error ("Expected string key before ':' at line 1, column 1")
+          # requires the first byte to be a colon, which a plain-text or HTML
+          # response cannot produce. Front-truncation and a foreign response are
+          # different bugs, and the leading bytes are what separate them.
+          if ! jq empty composer-audit.json 2>/dev/null; then
+            echo "::error::composer audit output is not JSON (exit $AUDIT_EXIT)"
+            echo "--- composer-audit.json: $(wc -c < composer-audit.json) bytes ---"
+            echo "--- first 512 bytes, as bytes ---"
+            head -c 512 composer-audit.json | od -c
+            echo "--- first 2000 bytes, as text ---"
+            head -c 2000 composer-audit.json
+            echo ""
+            echo "--- composer-audit.err ---"
+            cat composer-audit.err || true
+            exit 1
+          fi
+
           # Severity rank; unknown ranks as high so an unlabelled advisory is not
           # silently waved through. drupal/* blocks at ANY severity.
           rank() { case "${1,,}" in critical) echo 4;; high) echo 3;; medium|moderate) echo 2;; low) echo 1;; *) echo 3;; esac; }
@@ -326,6 +347,19 @@ jobs:
             fi
             echo "::warning::$BLOCKING_COUNT blocking advisor(y/ies) — composer_audit_gate=false, warn-only"
           fi
+
+      # Keeps the whole payload, not just the head above, so a mid-file problem
+      # is diagnosable too. Failure-only, so a clean gate uploads nothing.
+      - name: Upload composer audit payload on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: composer-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            composer-audit.json
+            composer-audit.err
+          retention-days: 14
+          if-no-files-found: ignore
 
   route_smoke:
     name: Route Smoke (aggregate gate)
