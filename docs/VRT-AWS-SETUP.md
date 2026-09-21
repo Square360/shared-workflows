@@ -68,16 +68,30 @@ Attach the following bucket policy to allow public read on reports and diffs onl
 
 ---
 
-## 3. GitHub Secrets
+## 3. Credentials and configuration
 
-Store the following as **org-level** GitHub secrets (or repo-level if preferred):
+The IAM credentials are secrets and live in 1Password, loaded by the workflows from
+`op://s360-cicd/aws-ci`:
 
-| Secret name | Value |
+| 1Password field | Value |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | Access key ID from the `github-vrt-bot` IAM user |
-| `AWS_SECRET_ACCESS_KEY` | Secret access key from the `github-vrt-bot` IAM user |
+| `access-key-id` | Access key ID from the `github-vrt-bot` IAM user |
+| `secret-access-key` | Secret access key from the `github-vrt-bot` IAM user |
+
+The bucket and region are **org-level GitHub Actions variables**, not secrets:
+
+| Variable name | Value |
+|---|---|
 | `AWS_S3_BUCKET` | Bucket name, e.g. `square360-vrt-reports` |
 | `AWS_S3_REGION` | Region, e.g. `us-east-1` (optional — defaults to `us-east-1`) |
+
+They are variables rather than secrets on purpose. Anything resolved through
+1Password is registered with `core.setSecret()`, and the runner then scrubs that
+value from log output **and from the job summary** — which mangled the report link
+into `%2A%2A%2A.s3.%2A%2A%2A.amazonaws.com` (issue #153). Masking matches on the
+value, not the variable name, so the bucket cannot be loaded as a secret anywhere
+in the job if the summary is to render. Neither value is sensitive: the bucket is
+public-read by design so the report links work.
 
 ---
 
