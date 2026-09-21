@@ -173,22 +173,6 @@ jobs:
         CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
         SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
 
-    # Optional per-site bot-bypass token. Pantheon's AGCDN (Cloudflare) serves a
-    # JS challenge to headless Chrome, which never reaches networkidle, so every
-    # screenshot times out (TEDCO rc-2026-38, 2026-09-16: 30/30 timeouts). Sites
-    # behind the challenge store their bypass token as a field named after the
-    # site machine name on the s360-cicd "pantheon-bot-bypass" item. Missing
-    # field = step fails softly and VRT runs without the header, as before.
-    - name: Load bot-bypass token (optional)
-      id: bot_bypass
-      if: steps.vrt_check.outputs.enabled == 'true'
-      continue-on-error: true
-      uses: 1password/load-secrets-action@v5
-      with:
-        export-env: true
-      env:
-        BOT_BYPASS_TOKEN: op://s360-cicd/pantheon-bot-bypass/${{ inputs.pantheon_site }}
-
     - name: Install Terminus
       if: steps.vrt_check.outputs.enabled == 'true'
       env:
@@ -199,6 +183,54 @@ jobs:
           -o /usr/local/bin/terminus
         chmod +x /usr/local/bin/terminus
         terminus auth:login --machine-token="$TERMINUS_MACHINE_TOKEN"
+
+    # Bot-bypass token for Pantheon's new Cloudflare GCDN, which is replacing
+    # Fastly. Cloudflare serves a JS challenge to headless Chrome, which never
+    # reaches networkidle, so every screenshot times out (TEDCO rc-2026-38,
+    # 2026-09-16: 30/30 timeouts).
+    #
+    # Pantheon mints the token per site, so it is read in-flow from Terminus
+    # rather than mirrored into 1Password: nothing to register when a site moves
+    # off Fastly, and the 2026-12-01 rotation is picked up on its own. Sites
+    # still on Fastly are issued a token too and get the header as well; an
+    # unrecognised request header is ignored, which is cheaper than probing the
+    # CDN on every run.
+    #
+    # Soft by construction. Every failure path here leaves the token empty and
+    # VRT runs without the header, as it did before v4.10.2 — the missing-field
+    # path in that release took the whole job down with it (issue #151), so this
+    # step touches nothing but its own outputs and never exports to the job env.
+    - name: Load bot-bypass token
+      id: bot_bypass
+      if: steps.vrt_check.outputs.enabled == 'true'
+      env:
+        PANTHEON_SITE: ${{ inputs.pantheon_site }}
+      run: |
+        TOKEN=""
+        HEADER=""
+
+        # The gcdn commands ship as a plugin, not in the phar.
+        if terminus self:plugin:install pantheon-systems/terminus-gcdn-plugin --yes >/dev/null 2>&1; then
+          JSON=$(terminus gcdn:bot-bypass "$PANTHEON_SITE" --format=json 2>/dev/null) || JSON=""
+          if [[ -n "$JSON" ]]; then
+            FILTER='(if type == "object" then [.[]] else . end)
+                    | map(select(.role == "current")) | .[0]'
+            TOKEN=$(jq -r "${FILTER} | .token // empty"       <<< "$JSON" 2>/dev/null) || TOKEN=""
+            HEADER=$(jq -r "${FILTER} | .header_name // empty" <<< "$JSON" 2>/dev/null) || HEADER=""
+          fi
+        fi
+
+        if [[ -n "$TOKEN" ]]; then
+          echo "::add-mask::${TOKEN}"
+          echo "Bot bypass: token retrieved for ${PANTHEON_SITE}"
+        else
+          echo "Bot bypass: no token for ${PANTHEON_SITE} - VRT runs without the header"
+        fi
+
+        {
+          echo "token=${TOKEN}"
+          echo "header=${HEADER}"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Get site URLs
       id: get_urls
@@ -276,7 +308,8 @@ jobs:
         const TARGET_ENV      = process.env.TARGET_ENV || '';
         const PANTHEON_SITE   = process.env.PANTHEON_SITE || '';
         const EXTRA_PAGES_RAW = process.env.EXTRA_PAGES || '';
-        const BOT_BYPASS_TOKEN = process.env.BOT_BYPASS_TOKEN || '';
+        const BOT_BYPASS_TOKEN  = process.env.BOT_BYPASS_TOKEN || '';
+        const BOT_BYPASS_HEADER = process.env.BOT_BYPASS_HEADER || '';
         const RUN_ID          = process.env.GITHUB_RUN_ID || 'local';
         const RUN_ATTEMPT     = process.env.GITHUB_RUN_ATTEMPT || '1';
         const REPO            = process.env.GITHUB_REPO || '';
@@ -320,7 +353,7 @@ jobs:
         const defaultWait = config.vrt?.wait         ?? 6;
         const viewports   = config.vrt?.viewports    ?? DEFAULT_CONFIG.vrt.viewports;
         const pages       = [...(config.vrt?.pages   ?? DEFAULT_CONFIG.vrt.pages)];
-        const bypassHeader = config.vrt?.bypass_header ?? 'x-pantheon-bot-bypass';
+        const bypassHeader = config.vrt?.bypass_header || BOT_BYPASS_HEADER || 'x-pantheon-bot-bypass';
         const extraHeaders = BOT_BYPASS_TOKEN ? { [bypassHeader]: BOT_BYPASS_TOKEN } : {};
         console.log(`Bot bypass: ${BOT_BYPASS_TOKEN ? `header ${bypassHeader} set` : 'none (no token for this site)'}`);
 
@@ -759,7 +792,8 @@ jobs:
         TARGET_ENV:         ${{ inputs.target_env }}
         PANTHEON_SITE:      ${{ inputs.pantheon_site }}
         EXTRA_PAGES:        ${{ steps.vrt_check.outputs.extra_pages }}
-        BOT_BYPASS_TOKEN:   ${{ env.BOT_BYPASS_TOKEN }}
+        BOT_BYPASS_TOKEN:   ${{ steps.bot_bypass.outputs.token }}
+        BOT_BYPASS_HEADER:  ${{ steps.bot_bypass.outputs.header }}
         GITHUB_RUN_ID:      ${{ github.run_id }}
         GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         GITHUB_REPO:        ${{ github.repository }}
