@@ -58,8 +58,15 @@ runs:
         # Rows as an array whether drush emits an object keyed by index id or
         # a list.
         rows() { jq -c 'if type == "object" then [.[]] else . end' <<<"$1"; }
+        # Over Terminus, drush's stderr arrives on stdout: s360:solr:health
+        # prints " [warning] At least one index is out of step with Solr."
+        # ahead of the JSON exactly when there is something to fix. Keep
+        # output from the first line that opens the JSON document.
+        # Drush's errors come through on stdout the same way, so both
+        # streams are kept for the diagnostics below.
         health() {
-          terminus drush "${SITE}.${ENV}" -- s360:solr:health --format=json 2>/tmp/solr-health.err || true
+          terminus drush "${SITE}.${ENV}" -- s360:solr:health --format=json >/tmp/solr-health.out 2>/tmp/solr-health.err || true
+          awk 'f || /^(\{|\[$|\[\{|\[")/ { f = 1; print }' /tmp/solr-health.out
         }
         summary_table() {
           {
@@ -71,11 +78,11 @@ runs:
 
         before=$(health)
         if ! jq -e . >/dev/null 2>&1 <<<"$before"; then
-          if grep -qiE 'not defined|no commands defined|Command "s360:solr:health"' /tmp/solr-health.err; then
+          if cat /tmp/solr-health.out /tmp/solr-health.err | grep -qiE 'not defined|no commands defined|Command "s360:solr:health"'; then
             echo "::notice::Solr reconcile skipped: s360_solr_health is not enabled on ${SITE}.${ENV} (composer require square360/s360_solr_health)."
           else
             echo "::warning::Solr reconcile skipped: s360:solr:health returned no JSON on ${SITE}.${ENV}."
-            tail -n 20 /tmp/solr-health.err || true
+            cat /tmp/solr-health.out /tmp/solr-health.err | tail -n 20 || true
           fi
           exit 0
         fi
