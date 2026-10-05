@@ -32,6 +32,10 @@ inputs:
     description: 'Total seconds allowed for reindexing across all indexes; the rest is left to cron'
     required: false
     default: '600'
+  chunk_size:
+    description: 'Items per drush search-api:index process. Each chunk is a fresh process, so memory does not build up across a large index (one 3,101-item run hit the 512 MB limit at 2,110).'
+    required: false
+    default: '500'
 
 runs:
   using: 'composite'
@@ -45,6 +49,7 @@ runs:
         ENV: ${{ inputs.env }}
         BATCH: ${{ inputs.batch_size }}
         LIMIT: ${{ inputs.time_limit }}
+        CHUNK: ${{ inputs.chunk_size }}
       run: |
         # Every failure below is handled and reported; never abort on one.
         set +e
@@ -110,13 +115,32 @@ runs:
             echo "::warning::search-api:reset-tracker ${index} failed on ${SITE}.${ENV}"
             continue
           fi
-          timeout "$remaining" terminus drush "${SITE}.${ENV}" -- search-api:index "$index" --batch-size="$BATCH" -y
-          rc=$?
-          if [ "$rc" -eq 124 ]; then
+          # Index in chunks, each a fresh drush process, until the tracker
+          # has nothing left for this index, the budget runs out, or a chunk
+          # makes no progress.
+          left_before=""
+          timed_out=0
+          while :; do
+            remaining=$(( deadline - $(date +%s) ))
+            if [ "$remaining" -le 0 ]; then timed_out=1; break; fi
+            timeout "$remaining" terminus drush "${SITE}.${ENV}" -- search-api:index "$index" --limit="$CHUNK" --batch-size="$BATCH" -y
+            rc=$?
+            if [ "$rc" -eq 124 ]; then timed_out=1; break; fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::search-api:index ${index} exited ${rc} on ${SITE}.${ENV}"
+            fi
+            left=$(rows "$(health)" | jq -r --arg i "$index" '.[] | select(.index == $i) | ((.tracked // 0) - (.indexed // 0))')
+            if ! [[ "$left" =~ ^[0-9]+$ ]] || [ "$left" -le 0 ]; then break; fi
+            if [ "$left" = "$left_before" ]; then
+              echo "::warning::search-api:index ${index} made no progress (${left} item(s) left); stopping."
+              break
+            fi
+            echo "  ${index}: ${left} item(s) left"
+            left_before="$left"
+          done
+          if [ "$timed_out" -eq 1 ]; then
             echo "::warning::Solr reconcile time limit (${LIMIT}s) reached while indexing ${index}; cron will finish the rest."
             break
-          elif [ "$rc" -ne 0 ]; then
-            echo "::warning::search-api:index ${index} exited ${rc} on ${SITE}.${ENV}"
           fi
         done
 
