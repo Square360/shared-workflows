@@ -1,47 +1,60 @@
-name: Reusable PHP Quality (plugin class-load + unit tests)
+name: Reusable PHP Quality (class-load + unit tests + PHPStan)
 
 # -----------------------------------------------------------------------------
 # Static quality gate for Drupal repos — no database, no Pantheon, no deploy.
 #
-# Two checks, both cheap:
+# PHP version: taken from pantheon.yml `php_version` (what production runs),
+# falling back to composer.json `config.platform.php`, then 8.3. When both
+# files name a version and they disagree, the job fails: composer would be
+# resolving dependencies for a different PHP than production runs. An explicit
+# `php_version` input still overrides. (#159: a per-repo input in the caller's
+# workflow file was lost on a template update and the job ran 8.3 on an 8.4
+# site, dying on composer's platform check.)
 #
-#   1. Plugin class-load check (always runs when web/modules/custom exists).
-#      Maps every class under web/modules/custom/**/src/Plugin (and src/Hook)
-#      via Drupal's PSR-4 convention and class-loads each one through the
-#      composer autoloader plus a module/theme namespace map built from the
-#      checked-out tree. A contrib update that adds parameter/return types to
-#      a base-class method is a hard PHP compile fatal in every custom subclass
-#      with the old signature — invisible in watchdog and invisible on a green
-#      multidev unless review exercised the plugin-instantiation path. This
-#      check fails the PR that introduces the mismatch, with the exact PHP
-#      error. (Origin: som.yale.edu /admin/content outage, 2026-08-18 — VBO
-#      4.4.5→4.4.7 typed executeMultiple(); custom action fataled on LIVE.)
+# Three checks:
+#
+#   1. Plugin class-load check (runs when web/modules/custom exists).
+#      Runs CDI's packaged script,
+#      vendor/square360/copilot-drupal-instructions/skills/php-quality/
+#      references/plugin-class-load-check.php — one copy shared by local runs
+#      and CI (#158). It class-loads every class under web/modules/custom/**/
+#      src/Plugin and src/Hook; a contrib update that adds parameter/return
+#      types to a base-class method is a PHP compile fatal in every custom
+#      subclass with the old signature, invisible on a green multidev unless
+#      review exercised the plugin path. (Origin: som.yale.edu /admin/content
+#      outage, 2026-08-18.) Failures in extensions not enabled in
+#      config/sync/core.extension.yml are warnings unless
+#      CLASS_LOAD_FAIL_NOT_ENABLED=1. Repos on CDI older than 4.38.0 (no
+#      packaged script) get a warning and the check is skipped, not failed:
+#      a tooling version must not turn CI red across the fleet.
 #
 #   2. Unit tests (conditional; skip-don't-fail).
-#      Runs the custom modules' PHPUnit *Unit* suites only — no Kernel or
-#      Functional (those need a database and are a separate, heavier stage).
-#      Gates, each producing a visible "skipped" notice instead of a failure:
-#        - at least one web/modules/custom/*/tests/src/Unit directory exists
-#        - vendor/bin/phpunit is installed (repo carries drupal/core-dev or
-#          phpunit in require-dev, and composer_no_dev is false)
-#      The skip annotation is deliberate: the workflow rolls out portfolio-wide
-#      immediately, and coverage grows repo-by-repo as tests land (CDI SOP).
+#      Custom modules' PHPUnit *Unit* suites only (no Kernel/Functional: those
+#      need a database). Skips with a notice when there are no
+#      web/modules/custom/*/tests/src/Unit directories or no vendor/bin/phpunit.
 #
-# Composer note: the class-load check works with --no-dev (contrib base
-# classes are prod deps). Unit tests need dev deps; set composer_no_dev: false
-# (the default) on repos that carry tests.
+#   3. PHPStan (conditional).
+#      Runs `phpstan analyse` with the repo's phpstan.neon (CDI seeds one at
+#      level 5; level 8 is a release-time report, not a gate). Skips with a
+#      notice when there is no phpstan.neon(.dist) or no vendor/bin/phpstan.
+#      When phpstan-baseline.neon is still the empty file CDI seeded (the repo
+#      has not generated its real baseline yet), findings are reported as
+#      annotations without failing the job.
+#
+# Composer note: with composer_no_dev the class-load script (CDI is a dev
+# dependency), unit tests and PHPStan are all unavailable and skip with notices.
 # -----------------------------------------------------------------------------
 
 on:
   workflow_call:
     inputs:
       php_version:
-        description: 'PHP version to run checks under (match production)'
+        description: 'PHP version override. Empty (default) = pantheon.yml php_version, else composer.json config.platform.php, else 8.3'
         required: false
         type: string
-        default: '8.3'
+        default: ''
       composer_no_dev:
-        description: 'Install without dev dependencies (class-load check only; unit tests will skip)'
+        description: 'Install without dev dependencies (class-load, unit tests and PHPStan all skip)'
         required: false
         type: boolean
         default: false
@@ -55,6 +68,11 @@ on:
         required: false
         type: string
         default: ''
+      run_phpstan:
+        description: 'Run PHPStan when the repo has a phpstan.neon. Default on.'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   php-quality:
@@ -62,10 +80,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Resolve PHP version
+        id: php
+        env:
+          OVERRIDE: ${{ inputs.php_version }}
+        run: |
+          mm() { printf '%s' "$1" | grep -oE '^[0-9]+\.[0-9]+'; }
+          pantheon=""
+          if [ -f pantheon.yml ]; then
+            pantheon=$(mm "$(sed -nE "s/^php_version:[[:space:]]*[\"']?([0-9][0-9.]*).*/\1/p" pantheon.yml | head -n1)")
+          fi
+          platform=""
+          if [ -f composer.json ]; then
+            platform=$(mm "$(jq -r '.config.platform.php // empty' composer.json)")
+          fi
+          if [ -n "$pantheon" ] && [ -n "$platform" ] && [ "$pantheon" != "$platform" ]; then
+            echo "::error::pantheon.yml php_version is $pantheon but composer.json config.platform.php is $platform. Composer resolves dependencies for $platform while production runs $pantheon; make them match."
+            exit 1
+          fi
+          if [ -n "$OVERRIDE" ]; then
+            version="$OVERRIDE"; source="php_version input"
+          elif [ -n "$pantheon" ]; then
+            version="$pantheon"; source="pantheon.yml"
+          elif [ -n "$platform" ]; then
+            version="$platform"; source="composer.json config.platform.php"
+          else
+            version="8.3"; source="default (no pantheon.yml php_version or config.platform.php)"
+            echo "::notice::PHP version defaulted to 8.3: set php_version in pantheon.yml"
+          fi
+          echo "PHP $version (from $source)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: ${{ inputs.php_version }}
+          php-version: ${{ steps.php.outputs.version }}
           coverage: none
 
       - name: Get Composer cache directory
@@ -87,80 +136,20 @@ jobs:
           fi
 
       - name: Plugin class-load check
+        env:
+          SCAN_PATHS: ${{ inputs.scan_paths }}
+          EXCLUDE_CLASSES: ${{ inputs.exclude_classes }}
         run: |
           if [ ! -d web/modules/custom ]; then
             echo "::notice::plugin class-load check skipped: no web/modules/custom directory"
             exit 0
           fi
-          cat > /tmp/plugin-class-load-check.php <<'PHP'
-          <?php
-          // Class-loads every custom plugin class. A typed-signature mismatch
-          // against a (possibly just-bumped) base class is a PHP compile fatal:
-          // the shutdown handler names the class that was loading when it died.
-          $autoload = require 'vendor/autoload.php';
-
-          // Drupal only autoloads module namespaces at runtime — register a
-          // PSR-4 map for every extension in the tree (contrib + custom +
-          // profiles + themes) so parent classes resolve.
-          foreach (['web/core/modules', 'web/modules', 'web/profiles', 'web/themes'] as $root) {
-            if (!is_dir($root)) { continue; }
-            $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
-            foreach ($it as $f) {
-              if (substr($f->getFilename(), -9) === '.info.yml' && substr_count($f->getFilename(), '.') === 2) {
-                $dir = $f->getPath();
-                $name = substr($f->getFilename(), 0, -9);
-                if (is_dir("$dir/src")) {
-                  $autoload->addPsr4("Drupal\\$name\\", "$dir/src");
-                }
-              }
-            }
-          }
-
-          $scan_roots = array_filter(explode(' ', $argv[1] ?? 'web/modules/custom'));
-          $exclude = array_filter(explode(' ', $argv[2] ?? ''));
-          $current = NULL;
-          register_shutdown_function(function () use (&$current) {
-            $e = error_get_last();
-            if ($e && $current && in_array($e['type'], [E_ERROR, E_COMPILE_ERROR], TRUE)) {
-              fwrite(STDERR, "\n::error::class-load FAILED for $current\n::error::{$e['message']}\n");
-            }
-          });
-
-          $checked = 0;
-          $failures = 0;
-          foreach ($scan_roots as $root) {
-            if (!is_dir($root)) { continue; }
-            $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
-            foreach ($it as $f) {
-              $path = $f->getPathname();
-              // Only classes under a module's src/Plugin or src/Hook — the
-              // runtime-instantiated surfaces where a latent fatal hides.
-              if (!preg_match('#/src/(Plugin|Hook)/.*\.php$#', $path)) { continue; }
-              if (!preg_match('#(^|/)([a-z0-9_]+)/src/(.+)\.php$#', $path, $m)) { continue; }
-              $class = 'Drupal\\' . $m[2] . '\\' . str_replace('/', '\\', $m[3]);
-              if (in_array($class, $exclude, TRUE)) { continue; }
-              $current = $class;
-              try {
-                // Signature incompatibility is an uncatchable compile fatal —
-                // the shutdown handler reports it. Catchable Errors (a parent
-                // class genuinely absent, bad interface) report and continue.
-                class_exists($class, TRUE) || interface_exists($class, TRUE) || trait_exists($class, TRUE);
-              }
-              catch (\Throwable $e) {
-                fwrite(STDERR, "::error::class-load FAILED for $class — {$e->getMessage()}\n");
-                $failures++;
-              }
-              $checked++;
-            }
-          }
-          $current = NULL;
-          if ($failures) {
-            fwrite(STDERR, "::error::$failures of $checked plugin classes failed to load\n");
-            exit(1);
-          }
-          echo "class-loaded $checked plugin classes clean\n";
-          PHP
-          php /tmp/plugin-class-load-check.php "${{ inputs.scan_paths }}" "${{ inputs.exclude_classes }}"
+          SCRIPT=vendor/square360/copilot-drupal-instructions/skills/php-quality/references/plugin-class-load-check.php
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::warning::plugin class-load check skipped: $SCRIPT not found. Update square360/copilot-drupal-instructions to >= 4.38.0 (it ships the script; CI no longer carries its own copy). With composer_no_dev the script is not installed."
+            exit 0
+          fi
+          php "$SCRIPT" "$SCAN_PATHS" "$EXCLUDE_CLASSES"
 
       - name: Unit tests (custom modules)
         if: ${{ !inputs.composer_no_dev }}
@@ -187,3 +176,28 @@ jobs:
         if: ${{ inputs.composer_no_dev }}
         run: |
           echo "::notice::unit tests skipped: composer_no_dev is true (dev dependencies not installed)"
+
+      - name: PHPStan
+        if: ${{ !inputs.composer_no_dev && inputs.run_phpstan }}
+        run: |
+          CONFIG=""
+          for f in phpstan.neon phpstan.neon.dist; do
+            if [ -f "$f" ]; then CONFIG="$f"; break; fi
+          done
+          if [ -z "$CONFIG" ]; then
+            echo "::notice::PHPStan skipped: no phpstan.neon (recent CDI versions seed one; see the php-quality skill)"
+            exit 0
+          fi
+          if [ ! -x vendor/bin/phpstan ]; then
+            echo "::notice::PHPStan skipped: vendor/bin/phpstan not installed (add drupal/core-dev to require-dev)"
+            exit 0
+          fi
+          # A baseline still carrying CDI's seed header has never been
+          # generated: report the findings, don't fail on the debt that a
+          # real baseline would record.
+          if [ -f phpstan-baseline.neon ] && grep -q 'seeded empty by square360/copilot-drupal-instructions' phpstan-baseline.neon; then
+            echo "::warning::PHPStan baseline not generated yet: findings are reported, not failing. Generate and commit it: vendor/bin/phpstan analyse --generate-baseline (php-quality skill)."
+            vendor/bin/phpstan analyse -c "$CONFIG" --no-progress --memory-limit=1G --error-format=github || true
+            exit 0
+          fi
+          vendor/bin/phpstan analyse -c "$CONFIG" --no-progress --memory-limit=1G --error-format=github
