@@ -1,0 +1,124 @@
+name: 'Pantheon Solr reconcile (multidevs only)'
+description: >-
+  After a multidev deploy, compares each Search API index's tracker with what
+  its Solr core actually holds (drush s360:solr:health from
+  square360/s360_solr_health) and, for any index whose core is empty or short,
+  resets the tracker and reindexes. A new multidev gets the source
+  environment's database but an empty Solr core, so the tracker reads
+  "N of N indexed", search-api:index does nothing, and every Solr-backed view
+  is empty until someone reindexes by hand (#157). Multidevs only: refuses
+  dev, test and live. Never fails the deploy: problems are warnings.
+  Requires Terminus to be installed and authenticated.
+
+inputs:
+  site:
+    description: 'Pantheon site machine name'
+    required: true
+  env:
+    description: 'Multidev name (pr-*, rc-*, epr-*). Anything else is refused.'
+    required: true
+  machine_token:
+    description: 'Pantheon machine token. Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
+    required: true
+  skip:
+    description: 'If "true", do nothing. Pass the workflow_skip_terminus input through.'
+    required: false
+    default: 'false'
+  batch_size:
+    description: 'Items per search-api:index batch'
+    required: false
+    default: '100'
+  time_limit:
+    description: 'Total seconds allowed for reindexing across all indexes; the rest is left to cron'
+    required: false
+    default: '600'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Reconcile Solr with the Search API tracker
+      if: ${{ inputs.skip != 'true' }}
+      shell: bash
+      env:
+        TERMINUS_MACHINE_TOKEN: ${{ inputs.machine_token }}
+        SITE: ${{ inputs.site }}
+        ENV: ${{ inputs.env }}
+        BATCH: ${{ inputs.batch_size }}
+        LIMIT: ${{ inputs.time_limit }}
+      run: |
+        # Every failure below is handled and reported; never abort on one.
+        set +e
+        case "$ENV" in
+          pr-*|rc-*|epr-*) ;;
+          *)
+            echo "::warning::Solr reconcile refused for ${SITE}.${ENV}: multidevs only (a reset on dev/test/live is a full reindex under traffic)."
+            exit 0 ;;
+        esac
+
+        # Rows as an array whether drush emits an object keyed by index id or
+        # a list.
+        rows() { jq -c 'if type == "object" then [.[]] else . end' <<<"$1"; }
+        health() {
+          terminus drush "${SITE}.${ENV}" -- s360:solr:health --format=json 2>/tmp/solr-health.err || true
+        }
+        summary_table() {
+          {
+            echo "| Index | Tracked | Indexed | In Solr | State |"
+            echo "|---|---:|---:|---:|---|"
+            rows "$1" | jq -r '.[] | "| \(.index) | \(.tracked) | \(.indexed) | \(.solr) | \(.state) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+        }
+
+        before=$(health)
+        if ! jq -e . >/dev/null 2>&1 <<<"$before"; then
+          if grep -qiE 'not defined|no commands defined|Command "s360:solr:health"' /tmp/solr-health.err; then
+            echo "::notice::Solr reconcile skipped: s360_solr_health is not enabled on ${SITE}.${ENV} (composer require square360/s360_solr_health)."
+          else
+            echo "::warning::Solr reconcile skipped: s360:solr:health returned no JSON on ${SITE}.${ENV}."
+            tail -n 20 /tmp/solr-health.err || true
+          fi
+          exit 0
+        fi
+
+        mapfile -t targets < <(rows "$before" | jq -r '.[] | select(.state == "empty" or .state == "short") | .index')
+        echo "### Solr reconcile — ${SITE}.${ENV}" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${#targets[@]}" -eq 0 ]; then
+          echo "Solr matches the tracker on every index; nothing to do."
+          echo "Solr matches the tracker on every index." >> "$GITHUB_STEP_SUMMARY"
+          summary_table "$before"
+          exit 0
+        fi
+
+        echo "Before:" >> "$GITHUB_STEP_SUMMARY"
+        summary_table "$before"
+        deadline=$(( $(date +%s) + LIMIT ))
+        for index in "${targets[@]}"; do
+          remaining=$(( deadline - $(date +%s) ))
+          if [ "$remaining" -le 0 ]; then
+            echo "::warning::Solr reconcile time limit (${LIMIT}s) reached before ${index}; cron will finish indexing."
+            break
+          fi
+          echo "Resetting tracker and reindexing ${index} (up to ${remaining}s)..."
+          if ! terminus drush "${SITE}.${ENV}" -- search-api:reset-tracker "$index" -y; then
+            echo "::warning::search-api:reset-tracker ${index} failed on ${SITE}.${ENV}"
+            continue
+          fi
+          timeout "$remaining" terminus drush "${SITE}.${ENV}" -- search-api:index "$index" --batch-size="$BATCH" -y
+          rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "::warning::Solr reconcile time limit (${LIMIT}s) reached while indexing ${index}; cron will finish the rest."
+            break
+          elif [ "$rc" -ne 0 ]; then
+            echo "::warning::search-api:index ${index} exited ${rc} on ${SITE}.${ENV}"
+          fi
+        done
+
+        after=$(health)
+        if jq -e . >/dev/null 2>&1 <<<"$after"; then
+          echo "After:" >> "$GITHUB_STEP_SUMMARY"
+          summary_table "$after"
+          still=$(rows "$after" | jq -r '[.[] | select(.state == "empty" or .state == "short") | .index] | join(", ")')
+          if [ -n "$still" ]; then
+            echo "::warning::Solr still behind the tracker after reconcile: ${still}"
+          fi
+        fi
