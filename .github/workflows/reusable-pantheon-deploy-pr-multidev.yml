@@ -52,10 +52,10 @@ on:
         type: string
         default: ''
       php_quality_php_version:
-        description: 'PHP version for the php-quality check (match production / pantheon.yml)'
+        description: 'PHP version override for the php-quality check. Empty (default) = auto: pantheon.yml php_version, else composer.json config.platform.php'
         required: false
         type: string
-        default: '8.3'
+        default: ''
       run_route_smoke:
         description: 'Run authenticated route-smoke against the deployed pr-N multidev. Default on; self-skips with a notice when the repo has no .github/smoke-routes.txt.'
         required: false
