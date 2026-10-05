@@ -1,3 +1,9 @@
+# Release 4.13.3 (2026-10-05)
+
+### Bug Fixes
+
+* PHP version detection exits silently when a source is missing (3b2d674)
+
 # Release 4.13.2 (2026-10-05)
 
 ### Bug Fixes
