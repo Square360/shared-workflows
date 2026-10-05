@@ -1,3 +1,9 @@
+# Release 4.13.1 (2026-10-05)
+
+### Bug Fixes
+
+* solr-reconcile: read the JSON past drush's warning line (58e43da)
+
 # Release 4.13.0 (2026-10-05)
 
 ### Features
