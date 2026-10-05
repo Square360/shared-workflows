@@ -1,3 +1,9 @@
+# Release 4.12.0 (2026-10-05)
+
+### Features
+
+* php-quality: PHP version from pantheon.yml, CDI's class-load script, PHPStan step (86337da)
+
 # Release 4.11.3 (2026-09-21)
 
 ### Bug Fixes
