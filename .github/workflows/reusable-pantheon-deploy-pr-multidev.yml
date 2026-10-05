@@ -277,7 +277,7 @@ jobs:
     # Catches typed-signature fatals against bumped contrib base classes that
     # green deploys and watchdog both miss (som.yale.edu 2026-08-18 incident).
     if: ${{ inputs.run_php_quality }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-php-quality.yml@3222fcb5a9802cf45f1d427dffc0cfc6908ba694  # v4.7.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-php-quality.yml@e14733accaa15c5de47f4ead43c267c5d058e970  # v4.12.0
     with:
       php_version: ${{ inputs.php_quality_php_version }}
       exclude_classes: ${{ inputs.php_quality_exclude_classes }}
