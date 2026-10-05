@@ -1,3 +1,9 @@
+# Release 4.13.2 (2026-10-05)
+
+### Bug Fixes
+
+* solr-reconcile: index in chunks, each a fresh drush process (c634056)
+
 # Release 4.13.1 (2026-10-05)
 
 ### Bug Fixes
