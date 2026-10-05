@@ -1,3 +1,9 @@
+# Release 4.13.4 (2026-10-05)
+
+### Bug Fixes
+
+* bump internal self-ref pin — pr-multidev php-quality to v4.13.3 (3d9fcaf)
+
 # Release 4.13.3 (2026-10-05)
 
 ### Bug Fixes
