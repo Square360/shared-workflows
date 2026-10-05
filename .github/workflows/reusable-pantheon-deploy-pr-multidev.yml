@@ -41,6 +41,11 @@ on:
         required: false
         type: boolean
         default: false
+      solr_reindex_on_mismatch:
+        description: 'After drush deploy, reset the Search API tracker and reindex any index whose Solr core is empty or short (needs square360/s360_solr_health). Also on when the repo/org variable SOLR_REINDEX_ON_MISMATCH is "true".'
+        required: false
+        type: boolean
+        default: false
       run_php_quality:
         description: 'Run the php-quality check (class-load + custom unit suites) alongside the deploy. Default on.'
         required: false
@@ -174,6 +179,18 @@ jobs:
           machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
           skip: ${{ inputs.workflow_skip_terminus }}
           pr_title: ${{ github.event.pull_request.title }}
+
+      # Solr reconcile (#157): a fresh multidev has the source DB's tracker but an
+      # empty Solr core. Opt-in per repo: SOLR_REINDEX_ON_MISMATCH=true
+      # (repository or org variable) or the solr_reindex_on_mismatch input.
+      - name: Reconcile Solr with the Search API tracker
+        if: ${{ inputs.solr_reindex_on_mismatch || vars.SOLR_REINDEX_ON_MISMATCH == 'true' }}
+        uses: Square360/shared-workflows/.github/actions/pantheon-solr-reconcile@v4  # moving major tag; new in 4.13.0
+        with:
+          site: ${{ inputs.pantheon_site }}
+          env: ${{ steps.derive.outputs.target_env }}
+          machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
+          skip: ${{ inputs.workflow_skip_terminus }}
 
       - name: Get multidev URL
         id: multidev_url
