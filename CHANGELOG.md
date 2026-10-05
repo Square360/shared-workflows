@@ -1,3 +1,9 @@
+# Release 4.13.0 (2026-10-05)
+
+### Features
+
+* multidev: reconcile Solr with the Search API tracker after a DB clone (032924a)
+
 # Release 4.12.1 (2026-10-05)
 
 ### Bug Fixes
