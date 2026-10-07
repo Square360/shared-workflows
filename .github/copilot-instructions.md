@@ -37,7 +37,7 @@ on:
 Standard secrets across all workflows:
 - `PANTHEON_SSH_KEY`: SSH key for Pantheon Git access
 - `PANTHEON_MACHINE_TOKEN`: Pantheon API authentication
-- `CI_GH_TOKEN`: GitHub token for semantic release (optional)
+- Semantic release pushes with a short-lived token from the "Square360 CI" GitHub App (`s360-cicd/github-app-ci` in 1Password), not a personal token
 
 ### 3. Input Parameter Conventions
 - Use descriptive names with underscores
