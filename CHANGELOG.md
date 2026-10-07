@@ -1,3 +1,9 @@
+# Release 4.14.1 (2026-10-07)
+
+### Bug Fixes
+
+* bump internal self-ref pin — deploy-dev semantic-release to v4.14.0 (723a358)
+
 # Release 4.14.0 (2026-10-07)
 
 ### Features
