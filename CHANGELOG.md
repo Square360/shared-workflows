@@ -1,3 +1,9 @@
+# Release 4.14.0 (2026-10-07)
+
+### Features
+
+* semantic-release: push releases with the Square360 CI GitHub App (0e94713)
+
 # Release 4.13.4 (2026-10-05)
 
 ### Bug Fixes
