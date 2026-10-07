@@ -21,7 +21,7 @@ on:
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
-        description: '1Password service account token — loads CI_GH_TOKEN from s360-cicd vault'
+        description: '1Password service account token — loads the Square360 CI GitHub App key from s360-cicd vault'
 
 defaults:
   run:
@@ -52,7 +52,19 @@ jobs:
         with:
           export-env: true
         env:
-          CI_GH_TOKEN: op://s360-cicd/github/token
+          CI_APP_ID: op://s360-cicd/github-app-ci/app-id
+          CI_APP_PRIVATE_KEY: op://s360-cicd/github-app-ci/private-key
+
+      # Short-lived token from the org-owned "Square360 CI" GitHub App (contents:
+      # write, scoped to this repo, expires in an hour). It pushes the release
+      # commit past the branch ruleset via the App's bypass entry, so releases
+      # no longer ride a personal access token.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.CI_APP_ID }}
+          private-key: ${{ env.CI_APP_PRIVATE_KEY }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -231,4 +243,4 @@ jobs:
             "$semrel"
           fi
         env:
-          GITHUB_TOKEN: ${{ env.CI_GH_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
