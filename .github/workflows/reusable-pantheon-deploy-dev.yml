@@ -76,7 +76,7 @@ jobs:
   semantic_release:
     name: Semantic Release
     if: ${{ inputs.run_semantic_release }}
-    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+    uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@2692488e054105f9c79f366980ac9fb15deabde7  # v4.14.0
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
