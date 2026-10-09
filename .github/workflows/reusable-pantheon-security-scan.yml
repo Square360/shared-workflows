@@ -72,7 +72,7 @@ defaults:
 jobs:
   security_scan:
     name: OWASP ZAP Baseline Scan
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       pull-requests: write
       contents: read

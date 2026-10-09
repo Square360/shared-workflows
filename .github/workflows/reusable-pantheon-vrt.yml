@@ -44,7 +44,7 @@ defaults:
 jobs:
   visual_regression:
     name: Visual Regression Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       pull-requests: write
       contents: read

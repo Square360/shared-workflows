@@ -1,0 +1,150 @@
+name: Runner image smoke test
+
+# -----------------------------------------------------------------------------
+# Runs what the reusable workflows depend on from the runner image, side by
+# side on the current and next Ubuntu image, so a runner migration is tested
+# before `ubuntu-latest` moves (issue #170: ubuntu-latest -> 26.04 from
+# 2026-10-19). No secrets, no Pantheon, no deploys: tool presence and the
+# install steps that pull OS packages.
+#
+# Covers:
+#   - preinstalled CLIs the workflows call (jq, curl, git, gh, aws, rsync, ssh, python3)
+#   - Terminus phar on the runner's own PHP (deploy-dev never runs setup-php)
+#   - setup-php 8.4 + composer + `composer audit --locked` (RC gate path)
+#   - setup-node 24 + semantic-release install (release path)
+#   - setup-node 20 + Playwright chromium --with-deps + one screenshot (VRT path)
+#   - ZAP container start (security-scan path)
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'test/ubuntu-*'
+    paths:
+      - '.github/workflows/runner-image-smoke.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: ${{ matrix.image }} / ${{ matrix.check }}${{ matrix.check == 'terminus' && format(' {0}', matrix.terminus) || '' }}
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+        check: [preinstalled, terminus, php-composer, semantic-release, playwright, zap]
+        terminus: ['4.2.2']
+        include:
+          - { image: ubuntu-24.04, check: terminus, terminus: '4.3.3' }
+          - { image: ubuntu-26.04, check: terminus, terminus: '4.3.3' }
+    steps:
+      - name: Image
+        run: |
+          . /etc/os-release && echo "$PRETTY_NAME"
+          uname -r
+          echo "ImageVersion=${ImageVersion:-unknown}"
+
+      - name: Preinstalled CLIs
+        if: matrix.check == 'preinstalled'
+        run: |
+          set -u
+          fail=0
+          for t in jq curl git gh aws rsync ssh python3 sed awk node npm php composer docker; do
+            if command -v "$t" >/dev/null; then
+              case "$t" in
+                ssh) v=$(ssh -V 2>&1) ;;
+                aws) v=$(aws --version 2>&1) ;;
+                *)   v=$("$t" --version 2>&1 | head -1) ;;
+              esac
+              printf '%-8s %s\n' "$t" "$v"
+            else
+              printf '%-8s MISSING\n' "$t"; fail=1
+            fi
+          done
+          echo '{"a":{"b":[1,2]}}' | jq -e '.a.b | length == 2' >/dev/null
+          exit $fail
+
+      - name: Terminus on the runner's PHP
+        if: matrix.check == 'terminus'
+        run: |
+          php --version | head -1
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            "https://github.com/pantheon-systems/terminus/releases/download/${{ matrix.terminus }}/terminus.phar" -o terminus
+          chmod +x terminus
+          # Deprecation output on stderr is what a newer PHP breaks first; show it.
+          ./terminus --version 2> terminus.err; rc=$?
+          cat terminus.err
+          ./terminus list --format=json 2>>terminus.err | jq -e '.commands | length > 50' >/dev/null
+          if grep -qiE 'deprecated|fatal|warning' terminus.err; then
+            echo "::warning::Terminus emitted PHP notices on this image (see above)"
+          fi
+          exit $rc
+
+      - name: Setup PHP 8.4
+        if: matrix.check == 'php-composer'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: composer:v2
+          coverage: none
+
+      - name: composer require + audit --locked
+        if: matrix.check == 'php-composer'
+        run: |
+          php --version | head -1
+          mkdir -p /tmp/c && cd /tmp/c
+          echo '{"require":{"psr/log":"^3"}}' > composer.json
+          composer update --no-interaction --no-progress
+          set +e
+          composer audit --locked --format=json --no-interaction > audit.json
+          set -e
+          jq -e 'has("advisories")' audit.json
+
+      - name: Setup Node 24
+        if: matrix.check == 'semantic-release'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install semantic-release
+        if: matrix.check == 'semantic-release'
+        run: |
+          cd "$RUNNER_TEMP"
+          npm install --no-save semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github conventional-changelog-conventionalcommits
+          npx semantic-release --version
+
+      - name: Setup Node 20
+        if: matrix.check == 'playwright'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Playwright chromium --with-deps + screenshot
+        if: matrix.check == 'playwright'
+        run: |
+          cd "$RUNNER_TEMP"
+          npm install --no-save playwright pixelmatch pngjs js-yaml@^4
+          npx playwright install chromium --with-deps
+          cat > shot.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          const b = await chromium.launch();
+          const p = await b.newPage();
+          await p.setContent('<h1 style="font-family:sans-serif">smoke</h1>');
+          await p.screenshot({ path: 'shot.png' });
+          await b.close();
+          EOF
+          node shot.mjs
+          test -s shot.png && file shot.png
+
+      - name: ZAP container
+        if: matrix.check == 'zap'
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker run --rm ghcr.io/zaproxy/zaproxy:stable zap.sh -cmd -version

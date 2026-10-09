@@ -15,7 +15,7 @@ on:
 jobs:
   move_major_tag:
     name: Point vMAJOR at the new release
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:

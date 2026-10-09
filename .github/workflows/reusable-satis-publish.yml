@@ -63,7 +63,7 @@ defaults:
 jobs:
   publish:
     name: Trigger satis rebuild and poll
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
         uses: 1password/load-secrets-action/configure@v5

@@ -1,0 +1,178 @@
+name: 'Composer security audit gate'
+description: 'Audits composer.lock for known security advisories and fails on blocking ones. Shared by the RC multidev gate and the DEV deploy gate (#168). Assumes the repo is already checked out.'
+
+# Blocking rule (one rule for every caller, George 2026-10-09: "only on major
+# or security issues"): an advisory blocks when its severity ranks at
+# min_severity or above (default high).
+#
+#   - Non-drupal packages: composer's own severity field.
+#   - drupal/* packages: packages.drupal.org reports severity as null, so the
+#     Drupal risk tier is read from the advisory title instead:
+#       Highly critical -> critical   Critical -> high
+#       Moderately critical -> medium Less critical / Not critical -> low
+#   - Anything unrankable (null severity, no tier in the title) ranks as high,
+#     so an unlabelled advisory is never silently waved through.
+#   - require-dev packages are not audited (--no-dev): they never ship.
+#
+# Everything below the threshold is still listed in the summary as a warning.
+
+inputs:
+  gate:
+    description: "'true' fails the step on blocking advisories; 'false' downgrades to warn-only."
+    required: false
+    default: 'true'
+  min_severity:
+    description: 'Minimum severity that blocks: low | medium | high | critical.'
+    required: false
+    default: 'high'
+  context:
+    description: 'What is being gated, for the summary heading and error line (e.g. "release candidate", "DEV deploy").'
+    required: false
+    default: 'release candidate'
+
+outputs:
+  advisory_count:
+    description: 'All advisories found.'
+    value: ${{ steps.audit.outputs.advisory_count }}
+  drupal_count:
+    description: 'Advisories on drupal/* packages.'
+    value: ${{ steps.audit.outputs.drupal_count }}
+  blocking_count:
+    description: 'Advisories at or above min_severity.'
+    value: ${{ steps.audit.outputs.blocking_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.4'
+        tools: composer:v2
+        coverage: none
+
+    - name: Run composer audit
+      id: audit
+      shell: bash
+      env:
+        GATE: ${{ inputs.gate }}
+        MIN_SEVERITY: ${{ inputs.min_severity }}
+        CONTEXT: ${{ inputs.context }}
+      run: |
+        set -euo pipefail
+        if [[ ! -f composer.lock ]]; then
+          echo "No composer.lock — nothing to audit."
+          for k in advisory_count drupal_count blocking_count; do echo "$k=0" >> "$GITHUB_OUTPUT"; done
+          exit 0
+        fi
+
+        # --locked audits composer.lock directly: callers never run composer install,
+        # so without it composer reports "No installed packages found" and exits 1.
+        # --no-dev: the Pantheon build installs with --no-dev (pantheon-push), so
+        # dev-only packages (phpunit, php_codesniffer, composer/composer) never
+        # reach a server and do not gate a deploy.
+        # composer audit exits non-zero when advisories exist; we decide below.
+        set +e
+        composer audit --locked --no-dev --format=json --no-interaction > composer-audit.json 2>composer-audit.err
+        AUDIT_EXIT=$?
+        set -e
+        if [[ ! -s composer-audit.json ]]; then
+          echo "::error::composer audit produced no JSON (exit $AUDIT_EXIT)"; cat composer-audit.err; exit 1
+        fi
+
+        # Validate before extracting (issue #150). A non-JSON payload used to
+        # surface as a bare "jq: parse error" with neither stream in the log.
+        # Dump the payload as bytes, not just text: front-truncation and a
+        # foreign response are different bugs, and the leading bytes separate them.
+        if ! jq empty composer-audit.json 2>/dev/null; then
+          echo "::error::composer audit output is not JSON (exit $AUDIT_EXIT)"
+          echo "--- composer-audit.json: $(wc -c < composer-audit.json) bytes ---"
+          echo "--- first 512 bytes, as bytes ---"
+          head -c 512 composer-audit.json | od -c
+          echo "--- first 2000 bytes, as text ---"
+          head -c 2000 composer-audit.json
+          echo ""
+          echo "--- composer-audit.err ---"
+          cat composer-audit.err || true
+          exit 1
+        fi
+
+        rank() { case "${1,,}" in critical) echo 4;; high) echo 3;; medium|moderate) echo 2;; low) echo 1;; *) echo 3;; esac; }
+        # Drupal risk tier from the title ("Webform - Critical - Remote Code Execution - SA-…").
+        # Order matters: the qualified tiers contain the bare word "critical".
+        drupal_tier() {
+          local t="${1,,}"
+          case "$t" in
+            *"highly critical"*)     echo critical ;;
+            *"moderately critical"*) echo medium ;;
+            *"less critical"*|*"not critical"*) echo low ;;
+            *critical*)              echo high ;;
+            *)                       echo unknown ;;
+          esac
+        }
+        MIN_RANK=$(rank "$MIN_SEVERITY")
+
+        jq -r '[.advisories // {} | to_entries[] as $e | $e.value[]? | . + {package: $e.key}]
+               | sort_by(.package)[]
+               | [.package, (.severity // "unknown"), (.advisoryId // .cve // "advisory"), (.link // ""), (.title // "")] | @tsv' \
+          composer-audit.json > advisories.tsv
+
+        ADVISORY_COUNT=$(wc -l < advisories.tsv | tr -d ' ')
+        DRUPAL_COUNT=0; BLOCKING_COUNT=0
+        {
+          echo "### Composer security audit — ${CONTEXT}"
+          echo ""
+          if [[ "$ADVISORY_COUNT" -eq 0 ]]; then
+            echo "✅ No known security advisories in \`composer.lock\`."
+          else
+            echo "| Blocks | Package | Severity | Advisory | Title |"
+            echo "|:--:|---|---|---|---|"
+          fi
+        } > audit-summary.md
+        while IFS=$'\t' read -r pkg sev adv link title; do
+          [[ -z "$pkg" ]] && continue
+          if [[ "$pkg" == drupal/* ]]; then
+            DRUPAL_COUNT=$((DRUPAL_COUNT+1))
+            [[ "$sev" == "unknown" ]] && sev=$(drupal_tier "$title")
+          fi
+          blocks="no"
+          [[ $(rank "$sev") -ge $MIN_RANK ]] && blocks="yes"
+          [[ "$blocks" == "yes" ]] && BLOCKING_COUNT=$((BLOCKING_COUNT+1))
+          mark=$([[ "$blocks" == "yes" ]] && echo "❌" || echo "⚠️")
+          advcell=$adv; [[ -n "$link" ]] && advcell="[$adv]($link)"
+          printf '| %s | %s | %s | %s | %s |\n' "$mark" "$pkg" "$sev" "$advcell" "${title//|/\\|}" >> audit-summary.md
+        done < advisories.tsv
+        {
+          echo ""
+          echo "- Advisories: $ADVISORY_COUNT (drupal/*: $DRUPAL_COUNT, blocking: $BLOCKING_COUNT)"
+          echo "- Rule: blocks at **$MIN_SEVERITY** or above. Drupal tiers come from the advisory title (Highly critical = critical, Critical = high, Moderately critical = medium, Less critical = low); anything unrankable counts as high."
+        } >> audit-summary.md
+        cat audit-summary.md >> "$GITHUB_STEP_SUMMARY"
+        cat audit-summary.md
+
+        {
+          echo "advisory_count=$ADVISORY_COUNT"
+          echo "drupal_count=$DRUPAL_COUNT"
+          echo "blocking_count=$BLOCKING_COUNT"
+        } >> "$GITHUB_OUTPUT"
+
+        if [[ "$BLOCKING_COUNT" -gt 0 ]]; then
+          if [[ "$GATE" == "true" ]]; then
+            echo "::error::$BLOCKING_COUNT blocking security advisor(y/ies) in composer.lock — ${CONTEXT} gate failed"
+            exit 1
+          fi
+          echo "::warning::$BLOCKING_COUNT blocking advisor(y/ies) — gate off (composer_audit_gate=false or COMPOSER_AUDIT_GATE=false), warn-only"
+        fi
+
+    # Keeps the whole payload, not just the head above, so a mid-file problem
+    # is diagnosable too. Failure-only, so a clean gate uploads nothing.
+    - name: Upload composer audit payload on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: composer-audit-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          composer-audit.json
+          composer-audit.err
+        retention-days: 14
+        if-no-files-found: ignore

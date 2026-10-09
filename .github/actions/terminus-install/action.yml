@@ -6,9 +6,9 @@ inputs:
     description: 'Pantheon machine token. Pass from caller-side secrets.PANTHEON_MACHINE_TOKEN.'
     required: true
   terminus_version:
-    description: 'Terminus release tag to install (e.g. 4.2.2). The default keeps consumers on a known-good version and avoids the GitHub API rate-limit failures the earlier "discover latest" curl was prone to.'
+    description: 'Terminus release tag to install (e.g. 4.3.3). The default keeps consumers on a known-good version and avoids the GitHub API rate-limit failures the earlier "discover latest" curl was prone to.'
     required: false
-    default: '4.2.2'
+    default: '4.3.3'
 
 runs:
   using: 'composite'

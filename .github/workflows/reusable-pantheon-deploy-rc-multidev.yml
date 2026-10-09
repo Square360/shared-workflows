@@ -14,14 +14,17 @@ name: Reusable Deploy to RC Multidev (Pantheon)
 #                      context to extract a task ID from)
 #   - Security scan: MANDATORY (force_run=true). The release-candidate gate.
 #   - Composer audit: MANDATORY. `composer audit` on develop's composer.lock,
-#          run on the runner in parallel with the deploy. Fails the workflow on
-#          any drupal/* advisory (Drupal SAs carry no exploitability tiers —
-#          every one is a public how-to) and on other packages at
-#          composer_audit_min_severity or above (default high). The deploy
-#          itself still runs so the RC reflects develop; the red run and the
-#          Slack line are the gate. Escape hatch: composer_audit_gate=false
-#          downgrades to warn-only. pr-* multidevs keep the caller template's
-#          warn-only sticky comment; this is the rc-* teeth (S360-936).
+#          run on the runner in parallel with the deploy, via the shared
+#          composer-audit action (same rule as the DEV deploy gate, #168).
+#          Fails the workflow on advisories at composer_audit_min_severity or
+#          above (default high); Drupal tiers come from the advisory title
+#          (Critical / Highly critical block, Moderately / Less critical warn).
+#          The deploy itself still runs so the RC reflects develop; the red
+#          run and the Slack line are the gate. Escape hatch: the
+#          composer_audit_gate=false input, or repo variable
+#          COMPOSER_AUDIT_GATE=false, downgrades to warn-only. pr-* multidevs
+#          keep the caller template's warn-only sticky comment; this is the
+#          rc-* teeth (S360-936).
 #   - VRT: opt-in via the --run-vrt PR label (preferred; present on the merged-PR
 #          closed payload), the [run-vrt]/[vrt] PR-body tags, or the merge
 #          commit message on develop (push wiring). All channels are checked;
@@ -64,12 +67,12 @@ on:
         type: boolean
         default: true
       composer_audit_gate:
-        description: 'Fail the workflow on blocking composer advisories (drupal/* at any severity, others at composer_audit_min_severity+). false = warn-only.'
+        description: 'Fail the workflow on advisories at composer_audit_min_severity or above (Drupal tier read from the advisory title). false = warn-only; repo variable COMPOSER_AUDIT_GATE=false does the same without a caller edit.'
         required: false
         type: boolean
         default: true
       composer_audit_min_severity:
-        description: 'Minimum severity that blocks for non-drupal packages: low | medium | high | critical.'
+        description: 'Minimum severity that blocks: low | medium | high | critical. Drupal: Highly critical = critical, Critical = high, Moderately critical = medium, Less critical = low.'
         required: false
         type: string
         default: 'high'
@@ -114,7 +117,7 @@ jobs:
       deployments: write
       contents: write
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       target_env: ${{ steps.derive.outputs.target_env }}
       multidev_url: ${{ steps.multidev_url.outputs.url }}
@@ -149,7 +152,7 @@ jobs:
           echo "Derived RC multidev name: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4  # moving major tag — advances with each 4.x release
         with:
           machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
@@ -172,7 +175,7 @@ jobs:
 
       - name: Push code to Pantheon multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -183,7 +186,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -243,7 +246,7 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, '--skip-multidev') &&
       !contains(github.event.pull_request.body, '[docs-only]') &&
       !contains(github.event.pull_request.body, '[skip-multidev]')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
@@ -256,127 +259,13 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.4'
-          tools: composer:v2
-          coverage: none
-
-      - name: Run composer audit
+      - name: Composer audit (RC gate)
         id: audit
-        env:
-          GATE: ${{ inputs.composer_audit_gate }}
-          MIN_SEVERITY: ${{ inputs.composer_audit_min_severity }}
-        run: |
-          set -euo pipefail
-          if [[ ! -f composer.lock ]]; then
-            echo "No composer.lock — nothing to audit."
-            for k in advisory_count drupal_count blocking_count; do echo "$k=0" >> "$GITHUB_OUTPUT"; done
-            exit 0
-          fi
-
-          # --locked audits composer.lock directly: this job never runs composer install,
-          # so without it composer reports "No installed packages found" and exits 1.
-          # composer audit exits non-zero when advisories exist; we decide below.
-          set +e
-          composer audit --locked --format=json --no-interaction > composer-audit.json 2>composer-audit.err
-          AUDIT_EXIT=$?
-          set -e
-          if [[ ! -s composer-audit.json ]]; then
-            echo "::error::composer audit produced no JSON (exit $AUDIT_EXIT)"; cat composer-audit.err; exit 1
-          fi
-
-          # Validate before extracting (issue #150). A non-JSON payload used to
-          # surface as a bare "jq: parse error" with neither stream in the log:
-          # stdout went to the file and the cat of stderr above only fires on the
-          # empty-file branch. Dump the payload as bytes, not just text - the
-          # observed error ("Expected string key before ':' at line 1, column 1")
-          # requires the first byte to be a colon, which a plain-text or HTML
-          # response cannot produce. Front-truncation and a foreign response are
-          # different bugs, and the leading bytes are what separate them.
-          if ! jq empty composer-audit.json 2>/dev/null; then
-            echo "::error::composer audit output is not JSON (exit $AUDIT_EXIT)"
-            echo "--- composer-audit.json: $(wc -c < composer-audit.json) bytes ---"
-            echo "--- first 512 bytes, as bytes ---"
-            head -c 512 composer-audit.json | od -c
-            echo "--- first 2000 bytes, as text ---"
-            head -c 2000 composer-audit.json
-            echo ""
-            echo "--- composer-audit.err ---"
-            cat composer-audit.err || true
-            exit 1
-          fi
-
-          # Severity rank; unknown ranks as high so an unlabelled advisory is not
-          # silently waved through. drupal/* blocks at ANY severity.
-          rank() { case "${1,,}" in critical) echo 4;; high) echo 3;; medium|moderate) echo 2;; low) echo 1;; *) echo 3;; esac; }
-          MIN_RANK=$(rank "$MIN_SEVERITY")
-
-          jq -r '[.advisories // {} | to_entries[] as $e | $e.value[]? | . + {package: $e.key}]
-                 | sort_by(.package)[]
-                 | [.package, (.severity // "unknown"), (.advisoryId // .cve // "advisory"), (.link // ""), (.title // "")] | @tsv' \
-            composer-audit.json > advisories.tsv
-
-          ADVISORY_COUNT=$(wc -l < advisories.tsv | tr -d ' ')
-          DRUPAL_COUNT=0; BLOCKING_COUNT=0
-          {
-            echo "### Composer security audit — release candidate"
-            echo ""
-            if [[ "$ADVISORY_COUNT" -eq 0 ]]; then
-              echo "✅ No known security advisories in \`composer.lock\`."
-            else
-              echo "| Blocks | Package | Severity | Advisory | Title |"
-              echo "|:--:|---|---|---|---|"
-            fi
-          } > audit-summary.md
-          while IFS=$'\t' read -r pkg sev adv link title; do
-            [[ -z "$pkg" ]] && continue
-            blocks="no"
-            if [[ "$pkg" == drupal/* ]]; then
-              DRUPAL_COUNT=$((DRUPAL_COUNT+1)); blocks="yes"
-            elif [[ $(rank "$sev") -ge $MIN_RANK ]]; then
-              blocks="yes"
-            fi
-            [[ "$blocks" == "yes" ]] && BLOCKING_COUNT=$((BLOCKING_COUNT+1))
-            mark=$([[ "$blocks" == "yes" ]] && echo "❌" || echo "⚠️")
-            advcell=$adv; [[ -n "$link" ]] && advcell="[$adv]($link)"
-            printf '| %s | %s | %s | %s | %s |\n' "$mark" "$pkg" "$sev" "$advcell" "${title//|/\\|}" >> audit-summary.md
-          done < advisories.tsv
-          {
-            echo ""
-            echo "- Advisories: $ADVISORY_COUNT (drupal/*: $DRUPAL_COUNT, blocking: $BLOCKING_COUNT)"
-            echo "- Rule: drupal/* blocks at any severity; other packages block at **$MIN_SEVERITY** or above."
-          } >> audit-summary.md
-          cat audit-summary.md >> "$GITHUB_STEP_SUMMARY"
-          cat audit-summary.md
-
-          {
-            echo "advisory_count=$ADVISORY_COUNT"
-            echo "drupal_count=$DRUPAL_COUNT"
-            echo "blocking_count=$BLOCKING_COUNT"
-          } >> "$GITHUB_OUTPUT"
-
-          if [[ "$BLOCKING_COUNT" -gt 0 ]]; then
-            if [[ "$GATE" == "true" ]]; then
-              echo "::error::$BLOCKING_COUNT blocking security advisor(y/ies) in composer.lock — release candidate gate failed"
-              exit 1
-            fi
-            echo "::warning::$BLOCKING_COUNT blocking advisor(y/ies) — composer_audit_gate=false, warn-only"
-          fi
-
-      # Keeps the whole payload, not just the head above, so a mid-file problem
-      # is diagnosable too. Failure-only, so a clean gate uploads nothing.
-      - name: Upload composer audit payload on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: Square360/shared-workflows/.github/actions/composer-audit@v4  # moving major tag — advances with each 4.x release
         with:
-          name: composer-audit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            composer-audit.json
-            composer-audit.err
-          retention-days: 14
-          if-no-files-found: ignore
+          gate: ${{ inputs.composer_audit_gate && vars.COMPOSER_AUDIT_GATE != 'false' }}
+          min_severity: ${{ inputs.composer_audit_min_severity }}
+          context: release candidate
 
   route_smoke:
     name: Route Smoke (aggregate gate)
@@ -451,7 +340,7 @@ jobs:
     name: Notify Slack
     needs: [deploy_rc_multidev, composer_audit]
     if: ${{ always() && inputs.slack_channel }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
         uses: 1password/load-secrets-action/configure@v5
