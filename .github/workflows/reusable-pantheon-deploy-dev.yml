@@ -85,7 +85,7 @@ jobs:
     needs: semantic_release
     # Run even when semantic_release is skipped (run_semantic_release=false).
     if: ${{ always() && (needs.semantic_release.result == 'success' || needs.semantic_release.result == 'skipped') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       deploy: ${{ steps.decide.outputs.deploy }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -128,7 +128,7 @@ jobs:
       deployments: write
       contents: write
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       env_url: ${{ steps.env_url.outputs.url }}
       error_message: ${{ steps.capture_error.outputs.error_message }}
@@ -159,7 +159,7 @@ jobs:
           PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4  # moving major tag — advances with each 4.x release
         with:
           machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
@@ -169,7 +169,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Push code to Pantheon DEV
         id: deploy_pantheon
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: dev
@@ -267,7 +267,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           env: dev
@@ -316,7 +316,7 @@ jobs:
     name: Notify Slack
     needs: [semantic_release, deploy_to_pantheon_dev, skip_gate]
     if: ${{ always() && inputs.slack_channel }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
         uses: 1password/load-secrets-action/configure@v5
