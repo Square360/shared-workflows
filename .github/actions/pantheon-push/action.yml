@@ -169,12 +169,14 @@ runs:
     # tolerating both failure modes. Safe because the redundant deepen-on-push
     # at line 382 still runs, properly guarded, before the actual `git push`.
     #
-    # Pinned to upstream 0.9.0 — if we ever bump that, this step needs to be
+    # Pinned to upstream 0.9.5 — if we ever bump that, this step needs to be
     # re-validated against the new source (sed pattern may not match).
+    # Re-validated 2026-10-09: 0.9.5 still has the unguarded call (main.sh:617,
+    # same tab-indented shape), so the patch is still needed and still matches.
     - name: Patch upstream push-to-pantheon to tolerate unshallow errors
       shell: bash
       env:
-        UPSTREAM_VERSION: "0.9.0"
+        UPSTREAM_VERSION: "0.9.5"
       run: |
         set -euo pipefail
         UPSTREAM_SCRIPT="/home/runner/work/_actions/pantheon-systems/push-to-pantheon/${UPSTREAM_VERSION}/scripts/main.sh"
@@ -199,7 +201,7 @@ runs:
         echo "Patched upstream main.sh: prepare_site_root's --unshallow is now tolerant."
 
     - name: Push to Pantheon
-      uses: pantheon-systems/push-to-pantheon@0.9.0
+      uses: pantheon-systems/push-to-pantheon@0.9.5
       env:
         COMPOSER_NO_SECURITY_BLOCKING: 1
       with:

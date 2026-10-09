@@ -66,7 +66,7 @@ jobs:
       deployments: write
       contents: write
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       target_env: ${{ steps.derive.outputs.target_env }}
       epic_ticket_id: ${{ steps.derive.outputs.epic_ticket_id }}
@@ -136,7 +136,7 @@ jobs:
           echo "Epic multidev: ${TARGET_ENV}"
 
       - name: Install Terminus
-        uses: Square360/shared-workflows/.github/actions/terminus-install@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/terminus-install@v4  # moving major tag — advances with each 4.x release
         with:
           machine_token: ${{ env.PANTHEON_MACHINE_TOKEN }}
 
@@ -158,7 +158,7 @@ jobs:
 
       - name: Push code to Pantheon epic multidev
         id: deploy
-        uses: Square360/shared-workflows/.github/actions/pantheon-push@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-push@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           target_env: ${{ steps.derive.outputs.target_env }}
@@ -169,7 +169,7 @@ jobs:
 
       - name: Run post-deploy drush commands
         id: drush_commands
-        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@4342823f58612cc70fba04424df7d78758493141  # v4.3.0
+        uses: Square360/shared-workflows/.github/actions/pantheon-post-deploy-drush@v4  # moving major tag — advances with each 4.x release
         with:
           site: ${{ inputs.pantheon_site }}
           env: ${{ steps.derive.outputs.target_env }}
@@ -269,7 +269,7 @@ jobs:
     name: Notify Slack
     needs: deploy_epic_multidev
     if: ${{ always() && inputs.slack_channel }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
         uses: 1password/load-secrets-action/configure@v5
