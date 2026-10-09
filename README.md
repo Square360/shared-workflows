@@ -23,6 +23,7 @@ Each file's header comment is the reference for its inputs, gates, labels and sk
 ## Composite actions (`.github/actions/`)
 
 - `terminus-install` — pinned Terminus release (4.3.3) + machine-token login.
+- `composer-audit` — the security-advisory gate shared by the RC and DEV deploys: blocks at high and above (Drupal tier read from the advisory title), production packages only.
 - `pantheon-push` — PHP + Composer install, push the workspace to a Pantheon env, verify the ref landed.
 - `pantheon-post-deploy-drush` — waits for the env, then `drush deploy` (updb → cr → cim → cr → deploy:hook) and cache clear.
 
@@ -31,6 +32,7 @@ Each file's header comment is the reference for its inputs, gates, labels and sk
 - **One secret:** `OP_SERVICE_ACCOUNT_TOKEN` (org-level). Every other credential is read from the 1Password `s360-cicd` vault at run time; nothing else is stored in GitHub.
 - **Three variables:** `PANTHEON_SITE`, `SLACK_CHANNEL`, `WORKFLOW_SKIP_TERMINUS`.
 - **The callers,** installed and kept current by `composer require square360/pantheon-github-workflows`.
+- **Optional:** `COMPOSER_AUDIT_GATE=false` turns the composer audit gate (RC and DEV deploy) into a warning, for a deliberate override mid-incident; delete the variable afterwards.
 - **Optional:** `S360_RUNNER_LABEL` overrides the runner image for every job (default `ubuntu-latest`). Set it on one repo to try a new image (`ubuntu-26.04`), or at org level to roll the whole fleet back (`ubuntu-24.04`) without a release.
 
 ## PR labels the workflows read
