@@ -1,3 +1,9 @@
+# Release 4.14.2 (2026-10-09)
+
+### Bug Fixes
+
+* Ubuntu 26 readiness, Terminus 4.3.3, push-to-pantheon 0.9.5 (#174) (3b31d8e)
+
 # Release 4.14.1 (2026-10-07)
 
 ### Bug Fixes
