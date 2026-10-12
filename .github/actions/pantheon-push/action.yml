@@ -390,21 +390,29 @@ runs:
     # Replaces upstream's "Update deployment status". Runs after verify-after-push
     # (upstream's ran before it), so a silently rejected push now shows as a
     # failed deployment instead of a green one. Best-effort, like the start step.
+    # job.status inside a composite action still reads "success" after one of
+    # the composite's own steps fails, so record the outcome with the status
+    # functions, which do see this action's steps.
+    - name: Record deployment failure
+      if: ${{ failure() && env.GITHUB_DEPLOYMENT_ID != '' }}
+      shell: bash
+      run: echo "PTP_DEPLOY_STATE=failure" >> "$GITHUB_ENV"
+
+    - name: Record deployment cancellation
+      if: ${{ cancelled() && env.GITHUB_DEPLOYMENT_ID != '' }}
+      shell: bash
+      run: echo "PTP_DEPLOY_STATE=inactive" >> "$GITHUB_ENV"
+
     - name: Finish GitHub deployment
       if: ${{ always() && env.GITHUB_DEPLOYMENT_ID != '' }}
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
-        JOB_STATUS: ${{ job.status }}
         ENV_URL: https://${{ inputs.target_env }}-${{ inputs.site }}.pantheonsite.io
         LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
-        case "$JOB_STATUS" in
-          success)   STATE=success ;;
-          cancelled) STATE=inactive ;;
-          *)         STATE=failure ;;
-        esac
+        STATE="${PTP_DEPLOY_STATE:-success}"
         gh api -X POST "repos/${REPO}/deployments/${GITHUB_DEPLOYMENT_ID}/statuses" \
           -f state="$STATE" -f environment_url="$ENV_URL" -f log_url="$LOG_URL" \
           -F auto_inactive=true --silent \
