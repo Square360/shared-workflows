@@ -26,6 +26,17 @@ name: Reusable Deploy to Pantheon DEV
 #   skip_gate job makes that call after semantic_release has run.
 #   workflow_dispatch runs have no PR and never skip.
 #
+# Composer audit gate (#168): before anything ships, `composer audit` runs on
+#   the target branch's composer.lock through the shared composer-audit action
+#   (same rule as the RC gate). A blocking advisory stops semantic-release AND
+#   the DEV push, so nothing is versioned or deployed with it. Blocks at
+#   composer_audit_min_severity or above (default high; Drupal tier read from
+#   the advisory title: Critical / Highly critical block, the rest warn).
+#   Before this, merging the release PR walked straight past a red RC gate
+#   (KMHA 2026-10-05: a Critical webform RCE reached LIVE).
+#   Mid-incident override: repo variable COMPOSER_AUDIT_GATE=false (no caller
+#   edit), or the composer_audit_gate=false input.
+#
 # v4: secrets loaded from 1Password via OP_SERVICE_ACCOUNT_TOKEN.
 #     The only GitHub secret required is OP_SERVICE_ACCOUNT_TOKEN (org-level).
 #     All other credentials (Pantheon, Slack) are resolved at runtime from
@@ -63,6 +74,16 @@ on:
         required: false
         type: boolean
         default: false
+      composer_audit_gate:
+        description: 'Block semantic-release and the DEV push on advisories at composer_audit_min_severity or above. false = warn-only; repo variable COMPOSER_AUDIT_GATE=false does the same without a caller edit.'
+        required: false
+        type: boolean
+        default: true
+      composer_audit_min_severity:
+        description: 'Minimum severity that blocks: low | medium | high | critical. Drupal: Highly critical = critical, Critical = high, Moderately critical = medium, Less critical = low.'
+        required: false
+        type: string
+        default: 'high'
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -73,8 +94,35 @@ defaults:
     shell: bash
 
 jobs:
+  composer_audit:
+    name: Composer security audit (DEV gate)
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    outputs:
+      advisory_count: ${{ steps.audit.outputs.advisory_count }}
+      drupal_count: ${{ steps.audit.outputs.drupal_count }}
+      blocking_count: ${{ steps.audit.outputs.blocking_count }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Composer audit (DEV gate)
+        id: audit
+        uses: Square360/shared-workflows/.github/actions/composer-audit@v4  # moving major tag — advances with each 4.x release
+        with:
+          gate: ${{ inputs.composer_audit_gate && vars.COMPOSER_AUDIT_GATE != 'false' }}
+          min_severity: ${{ inputs.composer_audit_min_severity }}
+          context: DEV deploy
+
   semantic_release:
     name: Semantic Release
+    # A failed audit skips this (implicit success()), so no version is cut for
+    # code that will not deploy.
+    needs: composer_audit
     if: ${{ inputs.run_semantic_release }}
     uses: Square360/shared-workflows/.github/workflows/reusable-semantic-release.yml@2692488e054105f9c79f366980ac9fb15deabde7  # v4.14.0
     secrets:
@@ -121,9 +169,11 @@ jobs:
 
   deploy_to_pantheon_dev:
     name: Deploy to Pantheon DEV
-    needs: [semantic_release, skip_gate]
+    needs: [composer_audit, semantic_release, skip_gate]
     # The gate already requires semantic_release to be success or skipped.
-    if: ${{ always() && needs.skip_gate.result == 'success' && needs.skip_gate.outputs.deploy == 'true' }}
+    # composer_audit must be checked explicitly: when it fails, semantic_release
+    # is skipped, which skip_gate accepts.
+    if: ${{ always() && needs.composer_audit.result == 'success' && needs.skip_gate.result == 'success' && needs.skip_gate.outputs.deploy == 'true' }}
     permissions:
       deployments: write
       contents: write
@@ -314,7 +364,7 @@ jobs:
 
   notify_slack:
     name: Notify Slack
-    needs: [semantic_release, deploy_to_pantheon_dev, skip_gate]
+    needs: [composer_audit, semantic_release, deploy_to_pantheon_dev, skip_gate]
     if: ${{ always() && inputs.slack_channel }}
     runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
@@ -334,6 +384,9 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          AUDIT_RESULT: ${{ needs.composer_audit.result }}
+          AUDIT_ADVISORIES: ${{ needs.composer_audit.outputs.advisory_count }}
+          AUDIT_BLOCKING: ${{ needs.composer_audit.outputs.blocking_count }}
           SEMANTIC_RESULT: ${{ needs.semantic_release.result }}
           DEPLOY_RESULT: ${{ needs.deploy_to_pantheon_dev.result }}
           GATE_DEPLOY: ${{ needs.skip_gate.outputs.deploy }}
@@ -354,7 +407,9 @@ jobs:
           # Decide overall status. Semantic-release failure takes precedence
           # because deploy is gated on semantic_release succeeding or being
           # skipped — a failure there means the deploy never ran.
-          if [[ "$SEMANTIC_RESULT" == "failure" ]]; then
+          if [[ "$AUDIT_RESULT" == "failure" ]]; then
+            STATUS_EMOJI=":no_entry:";         STATUS_COLOR="danger";  STATUS_TEXT="Blocked by security advisories"; PHASE="Composer audit"
+          elif [[ "$SEMANTIC_RESULT" == "failure" ]]; then
             STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed";    PHASE="Semantic Release"
           elif [[ "$DEPLOY_RESULT" == "success" ]]; then
             STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success";   PHASE="Deployment"
@@ -381,11 +436,22 @@ jobs:
             BACKUP_FIELD=",{\"title\": \"LIVE backup\", \"value\": \"took $((BACKUP_SECONDS/60))m$((BACKUP_SECONDS%60))s\", \"short\": true}"
           fi
 
+          AUDIT_FIELD=""
+          if [[ "$AUDIT_RESULT" == "success" ]]; then
+            if [[ "${AUDIT_ADVISORIES:-0}" -gt 0 ]]; then
+              AUDIT_FIELD=",{\"title\": \"Composer audit\", \"value\": \":warning: ${AUDIT_ADVISORIES} advisor(y/ies), none blocking\", \"short\": true}"
+            else
+              AUDIT_FIELD=",{\"title\": \"Composer audit\", \"value\": \":white_check_mark: clean\", \"short\": true}"
+            fi
+          fi
+
           ERROR_FIELD=""
           if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
             FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
             ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
             ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          elif [[ "$AUDIT_RESULT" == "failure" ]]; then
+            ERROR_FIELD=",{\"title\": \"Error Details\", \"value\": \"${AUDIT_BLOCKING:-?} blocking security advisor(y/ies) in composer.lock. Nothing was released or deployed. Update the packages, or set the COMPOSER_AUDIT_GATE=false repo variable for a deliberate override.\", \"short\": false}"
           elif [[ "$SEMANTIC_RESULT" == "failure" ]]; then
             ERROR_FIELD=",{\"title\": \"Error Details\", \"value\": \"Semantic release failed. Deployment was not attempted. Check the workflow logs.\", \"short\": false}"
           fi
@@ -405,7 +471,7 @@ jobs:
                     {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
                     {\"title\": \"Phase\", \"value\": \"${PHASE}\", \"short\": true},
                     {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
-                    ${ENV_URL_FIELD}${BACKUP_FIELD}
+                    ${ENV_URL_FIELD}${BACKUP_FIELD}${AUDIT_FIELD}
                     ${ERROR_FIELD}
                   ],
                   \"footer\": \"GitHub Actions\",
