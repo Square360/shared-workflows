@@ -14,7 +14,7 @@ This repository contains reusable GitHub Actions workflows for deploying Drupal 
 
 - **GitHub Actions**: Workflow automation platform
 - **Pantheon**: Drupal hosting platform with Terminus CLI
-- **pantheon-systems/push-to-pantheon@0.7.0**: Primary action for Pantheon deployments
+- **pantheon-systems/push-to-pantheon** (0.9.5): its `scripts/main.sh` does the Pantheon push, run by our `pantheon-push` composite (see below)
 - **Semantic Release**: Automated versioning and changelog generation
 - **Terminus**: Pantheon's command-line interface
 - **Drush**: Drupal command-line tool
@@ -54,19 +54,10 @@ Standard secrets across all workflows:
 
 ## Pantheon-Specific Guidelines
 
-### 1. pantheon-systems/push-to-pantheon Action
-When referencing this action:
-- **Always use exact version pinning** (e.g., `@0.7.0`) - This is Pantheon's official recommendation
-- Current stable version: `@0.7.0` (as of October 2025)
-- **Why exact versioning?**
-  - Action is in "Early Access" (pre-1.0.0) and may have breaking changes
-  - Pantheon explicitly recommends pinning to prevent unexpected behavior changes
-  - Input parameter names and behaviors may change between versions
-  - No major version tags (like `@v0`) are available yet
-- **When to update:**
-  - Check for new releases periodically
-  - Test thoroughly in development before updating production
-  - Once 1.0.0 is released, consider switching to major version pinning (`@v1`)
+### 1. pantheon-systems/push-to-pantheon
+- We do **not** `uses:` the action (#176): its composite runs `bobheadxi/deployments@v1`, which is unmaintained and Node 20 only. `.github/actions/pantheon-push` downloads upstream's self-contained `scripts/main.sh` at a pinned tag, checks a pinned sha256, and calls its functions in the action's order. The GitHub deployment record is posted by our own `gh api` steps.
+- Bumping upstream: change `UPSTREAM_VERSION` and `UPSTREAM_SHA256` together, re-read upstream's `action.yml` for added or reordered steps, and re-validate the unshallow sed patch.
+- Once upstream drops `bobheadxi`, going back to the plain action (exact-version pinned; upstream is pre-1.0) is an option.
 - Required parameters: `ssh_key`, `machine_token`, `site`, `target_env`
 - Standard settings:
   ```yaml
@@ -255,7 +246,7 @@ jobs:
     permissions:
       # Minimal required permissions
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Additional steps...
 ```
 
