@@ -1,3 +1,9 @@
+# Release 4.14.3 (2026-10-12)
+
+### Bug Fixes
+
+* deploy-dev enforces the composer audit gate; one shared rule (#168) (#175) (e107cd3)
+
 # Release 4.14.2 (2026-10-09)
 
 ### Bug Fixes
