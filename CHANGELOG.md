@@ -1,3 +1,9 @@
+# Release 4.14.5 (2026-10-13)
+
+### Bug Fixes
+
+* semantic-release: refuse a non-major Drupal extension release that drops a core major (#169) (#178) (ba874b4)
+
 # Release 4.14.4 (2026-10-13)
 
 ### Bug Fixes
