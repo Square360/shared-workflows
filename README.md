@@ -15,7 +15,7 @@ Reusable GitHub Actions workflows and composite actions for Square360's Pantheon
 | `reusable-route-smoke.yml` | called by the multidev workflows | authenticated key-route checks from `.github/smoke-routes.txt` |
 | `reusable-php-quality.yml` | called by the PR multidev workflow | plugin class-load check + unit suites |
 | `reusable-composer-diff.yml` | PR opened/updated | composer.lock diff as a sticky PR comment |
-| `reusable-semantic-release.yml` | called by the DEV deploy | version + changelog from conventional commits |
+| `reusable-semantic-release.yml` | called by the DEV deploy and module repos | version + changelog from conventional commits; on a Drupal extension, refuses a non-major release that drops a core major from `core_version_requirement` (`core_drop_ok: true` overrides) |
 | `reusable-satis-publish.yml` | module/theme repos | verify a tagged package is published on the Satis registry |
 
 Each file's header comment is the reference for its inputs, gates, labels and skip flags. Per-repo knobs live in the client repo under `.github/workflow_config/` (`vrt-config.yml`, `.pantheon-workflows-manifest.json`) and `.github/smoke-routes.txt`.

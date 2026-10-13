@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      core_drop_ok:
+        description: 'Allow a non-major release of a Drupal extension whose core_version_requirement drops a core major the previous release allowed (#169). Leave false unless the drop is deliberate.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         required: true
@@ -156,6 +161,86 @@ jobs:
           };
           EOJS
 
+          # Core-major guard (#169). On a Drupal extension (composer type
+          # drupal-*), fail before tagging when an *.info.yml drops a core
+          # major the last release allowed (^10 || ^11 -> ^11 || ^12) and the
+          # bump isn't a major: every site on that line would take a release
+          # its core can't run. verifyRelease also runs under --dry-run.
+          cat > core-version-guard.cjs << 'EOJS'
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+
+          const git = (args) => execFileSync('git', args, { encoding: 'utf8' });
+
+          // Each || branch becomes the span of core majors it allows:
+          // "^10.3" -> 10..10, ">=10.3" -> 10..any, ">=10.3 <12" -> 10..11,
+          // "<11.2" keeps 11.
+          const branches = (req) => req.split('||')
+            .map((part) => {
+              const lo = part.match(/\d+/);
+              if (!lo) return null;
+              let hi = Number(lo[0]);
+              const upper = part.match(/<(=?)\s*(\d+)(?:\.(\d+))?/);
+              if (upper) {
+                hi = Number(upper[2]) - (upper[1] || Number(upper[3] || 0) > 0 ? 0 : 1);
+              } else if (/>/.test(part)) {
+                hi = Infinity;
+              }
+              return { lo: Number(lo[0]), hi };
+            })
+            .filter(Boolean);
+          const allows = (bs, major) => bs.some((b) => b.lo <= major && major <= b.hi);
+
+          const requirement = (text) => {
+            const m = text.match(/^core_version_requirement:\s*['"]?([^'"#\n]+)/m);
+            return m ? m[1].trim() : null;
+          };
+
+          module.exports = {
+            verifyRelease: async (pluginConfig, { lastRelease, nextRelease, logger }) => {
+              let type = '';
+              try { type = JSON.parse(fs.readFileSync('composer.json', 'utf8')).type || ''; } catch (e) {}
+              if (!type.startsWith('drupal-') || type === 'drupal-project') return;
+              if (!lastRelease || !lastRelease.gitTag) return;
+              if (nextRelease.type === 'major') return;
+
+              const files = git(['ls-files', '*.info.yml'])
+                .split('\n')
+                .filter((f) => f && !/(^|\/)tests\//.test(f));
+
+              const drops = [];
+              for (const file of files) {
+                const now = requirement(fs.readFileSync(file, 'utf8'));
+                let before;
+                try { before = requirement(git(['show', `${lastRelease.gitTag}:${file}`])); } catch (e) { continue; }
+                if (!now || !before) continue;
+                const kept = branches(now);
+                // Majors the last release allowed, an open span checked at its floor.
+                const was = branches(before).flatMap((b) => {
+                  const top = Number.isFinite(b.hi) ? b.hi : b.lo;
+                  return Array.from({ length: top - b.lo + 1 }, (_, i) => b.lo + i);
+                });
+                const dropped = [...new Set(was)].filter((m) => !allows(kept, m));
+                if (dropped.length) drops.push(`${file}: "${before}" (${lastRelease.gitTag}) -> "${now}" drops Drupal ${dropped.join(', ')}`);
+              }
+              if (!drops.length) {
+                logger.log('core_version_requirement: no core major dropped since %s.', lastRelease.gitTag);
+                return;
+              }
+              const detail = drops.join('\n');
+              if (process.env.CORE_DROP_OK === 'true') {
+                logger.warn('core_drop_ok=true; releasing %s anyway:\n%s', nextRelease.version, detail);
+                return;
+              }
+              throw new Error(
+                `Refusing ${nextRelease.type} release ${nextRelease.version}: dropping a Drupal core major ` +
+                `is breaking for every site on this line, so it needs a major bump (a BREAKING CHANGE ` +
+                `commit) or core_drop_ok: true.\n${detail}`
+              );
+            }
+          };
+          EOJS
+
           cat > .releaserc.js << 'EOF'
           module.exports = {
             branches: ${{ inputs.release_branches }},
@@ -185,6 +270,7 @@ jobs:
                 }
               ],
               "./custom-release-notes.cjs",
+              "./core-version-guard.cjs",
               "@semantic-release/changelog",
               [
                 "@semantic-release/github",
@@ -244,3 +330,4 @@ jobs:
           fi
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          CORE_DROP_OK: ${{ inputs.core_drop_ok }}
