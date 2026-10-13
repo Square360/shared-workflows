@@ -24,7 +24,7 @@ Each file's header comment is the reference for its inputs, gates, labels and sk
 
 - `terminus-install` — pinned Terminus release (4.3.3) + machine-token login.
 - `composer-audit` — the security-advisory gate shared by the RC and DEV deploys: blocks at high and above (Drupal tier read from the advisory title), production packages only.
-- `pantheon-push` — PHP + Composer install, push the workspace to a Pantheon env, verify the ref landed.
+- `pantheon-push` — PHP + Composer install, push the workspace to a Pantheon env (upstream push-to-pantheon's `main.sh` at a pinned tag and sha256), verify the ref landed, record the GitHub deployment.
 - `pantheon-post-deploy-drush` — waits for the env, then `drush deploy` (updb → cr → cim → cr → deploy:hook) and cache clear.
 
 ## What a client repo needs

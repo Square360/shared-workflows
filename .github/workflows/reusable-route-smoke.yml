@@ -118,7 +118,7 @@ jobs:
       # (publickey)" after a 5-minute terminus retry crawl).
       - name: Load SSH key
         if: steps.routes_check.outputs.enabled == 'true'
-        uses: webfactory/ssh-agent@v0.9.1
+        uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ env.PANTHEON_SSH_KEY }}
 

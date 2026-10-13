@@ -1,5 +1,5 @@
 name: 'Push code to a Pantheon environment'
-description: 'Sets up PHP, installs Composer dependencies, and pushes the current workspace to a Pantheon environment via pantheon-systems/push-to-pantheon. Assumes the repo is already checked out.'
+description: 'Sets up PHP, installs Composer dependencies, and pushes the current workspace to a Pantheon environment via the pantheon-systems/push-to-pantheon script, and records a GitHub deployment. Assumes the repo is already checked out.'
 
 inputs:
   site:
@@ -109,7 +109,7 @@ runs:
     # Pre-flight: ensure the target Pantheon env is in git mode. If it's been
     # flipped to SFTP (e.g. someone opened the Dashboard Code view and toggled
     # it), the push would be rejected by Pantheon's pre-receive hook —
-    # `pantheon-systems/push-to-pantheon@0.9.0` swallows that exit code and
+    # upstream push-to-pantheon's main.sh swallows that exit code and
     # reports the step as successful. We pre-empt the most common cause here;
     # the verify-after-push step below catches anything else.
     #
@@ -147,93 +147,188 @@ runs:
           terminus connection:set "${SITE}.${TARGET_ENV}" git
         fi
 
-    # Upstream pantheon-systems/push-to-pantheon@0.9.0 has an unguarded
-    # `git fetch --unshallow origin` at scripts/main.sh:352 inside
-    # prepare_site_root (the empty-SITE_ROOT branch we take). It blows up two
-    # different ways depending on the checkout state:
-    #   - On a shallow clone (fetch-depth: 1): races with the runner's git
-    #     state and exits 128 with "fatal: shallow file has changed since we
-    #     read it". Intermittent.
-    #   - On a complete clone (fetch-depth: 0): errors deterministically with
-    #     "fatal: --unshallow on a complete repository does not make sense".
-    # Either way it aborts the deploy before our verify-after-push step can
-    # run, and the GitHub deployment is left marked "success" by upstream's
-    # bobheadxi/deployments@v1 wrapper despite the failure.
+    # We run upstream pantheon-systems/push-to-pantheon's script, not its action
+    # (#176). The action wraps scripts/main.sh in a composite whose two
+    # bobheadxi/deployments@v1 steps target Node 20; that action is unmaintained
+    # and has no Node 24 release, and nested `uses:` are fetched at job setup, so
+    # nothing we run beforehand can patch them out. main.sh is self-contained,
+    # so we download it at the pinned tag, check it against a pinned sha256, and
+    # call the same functions the action calls, in the same order. The GitHub
+    # deployment record is posted by our own steps below.
     #
-    # Upstream itself does the right thing later in push_to_pantheon (line 382):
-    # `is-shallow-repository` guard + `||` fallback. The bug is specifically
-    # the unguarded call in prepare_site_root.
+    # Bumping UPSTREAM_VERSION: re-read the new action.yml for added or
+    # reordered steps, update UPSTREAM_SHA256, and re-validate the unshallow
+    # patch below.
     #
-    # We can't edit upstream, so we sed-patch its main.sh on the runner before
-    # invoking the action. The patch appends `|| true` to the unshallow line —
-    # tolerating both failure modes. Safe because the redundant deepen-on-push
-    # at line 382 still runs, properly guarded, before the actual `git push`.
-    #
-    # Pinned to upstream 0.9.5 — if we ever bump that, this step needs to be
-    # re-validated against the new source (sed pattern may not match).
-    # Re-validated 2026-10-09: 0.9.5 still has the unguarded call (main.sh:617,
-    # same tab-indented shape), so the patch is still needed and still matches.
-    - name: Patch upstream push-to-pantheon to tolerate unshallow errors
+    # The unshallow patch: upstream's prepare_site_root has an unguarded
+    # `git fetch --unshallow origin` (main.sh:617 at 0.9.5). On a shallow clone it
+    # races the runner's git state ("shallow file has changed since we read it");
+    # on a complete clone it errors outright ("--unshallow on a complete
+    # repository does not make sense"). Either aborts the deploy before
+    # verify-after-push runs. We append `|| true`; push_to_pantheon still runs its
+    # own guarded unshallow before the push.
+    - name: Fetch upstream push-to-pantheon script
       shell: bash
       env:
         UPSTREAM_VERSION: "0.9.5"
+        UPSTREAM_SHA256: "8215f63778f72008df336b212a2f3360cb7a61061a57caed6b2c1605c3af1dce"
+        TARGET_ENV: ${{ inputs.target_env }}
       run: |
         set -euo pipefail
-        UPSTREAM_SCRIPT="/home/runner/work/_actions/pantheon-systems/push-to-pantheon/${UPSTREAM_VERSION}/scripts/main.sh"
-        if [ ! -f "${UPSTREAM_SCRIPT}" ]; then
-          echo "::error::Cannot find upstream main.sh at ${UPSTREAM_SCRIPT}. Has the upstream action version or layout changed?"
+        PTP_DIR="${RUNNER_TEMP}/push-to-pantheon-${UPSTREAM_VERSION}"
+        PTP_SCRIPT="${PTP_DIR}/main.sh"
+        mkdir -p "${PTP_DIR}"
+        curl -fsSL --retry 3 \
+          "https://raw.githubusercontent.com/pantheon-systems/push-to-pantheon/${UPSTREAM_VERSION}/scripts/main.sh" \
+          -o "${PTP_SCRIPT}"
+        echo "${UPSTREAM_SHA256}  ${PTP_SCRIPT}" | sha256sum -c -
+        # `#` delimiter: the replacement contains `||`.
+        sed -i 's#^\([[:space:]]*\)git fetch --unshallow origin$#\1git fetch --unshallow origin || true#' "${PTP_SCRIPT}"
+        if ! grep -qF 'git fetch --unshallow origin || true' "${PTP_SCRIPT}"; then
+          echo "::error::Unshallow patch did not apply. Upstream main.sh may have changed shape."
+          grep -n 'unshallow' "${PTP_SCRIPT}" || true
           exit 1
         fi
-        if grep -qF 'git fetch --unshallow origin || true' "${UPSTREAM_SCRIPT}"; then
-          echo "Upstream already patched; skipping (idempotent re-run)."
+        chmod +x "${PTP_SCRIPT}"
+        echo "PTP_SCRIPT=${PTP_SCRIPT}" >> "$GITHUB_ENV"
+        echo "PANTHEON_TARGET_ENV=${TARGET_ENV}" >> "$GITHUB_ENV"
+        echo "Fetched push-to-pantheon ${UPSTREAM_VERSION} main.sh (sha256 verified, unshallow patched)."
+
+    - name: Check required permissions
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        IFS=' ' read -r -a MISSING <<< "$("${PTP_SCRIPT}" check_missing_permissions)"
+        if [ ${#MISSING[@]} -gt 0 ]; then
+          "${PTP_SCRIPT}" get_missing_permissions_help "${MISSING[@]}"
+          exit 1
+        fi
+        echo "Required permissions present."
+
+    # Replaces upstream's "Start deployment" (bobheadxi/deployments@v1). Same
+    # environment name and payload keys, so upstream's cleanup and the PR
+    # timeline find it as before. Best-effort: the record is the "View
+    # deployment" link, not a gate (verify-after-push is the gate), so an API
+    # failure warns and the deploy carries on.
+    - name: Start GitHub deployment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        SITE: ${{ inputs.site }}
+        TARGET_ENV: ${{ inputs.target_env }}
+        SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -uo pipefail
+        BODY=$(jq -nc --arg ref "$REF" --arg env "$TARGET_ENV" \
+          --arg site "$SITE" --arg branch "$SOURCE_BRANCH" \
+          '{ref: $ref, environment: $env, auto_merge: false, required_contexts: [],
+            production_environment: false,
+            payload: {pantheon_site: $site, pantheon_env: $env, source_branch: $branch}}')
+        if ! ID=$(gh api -X POST "repos/${REPO}/deployments" --input - --jq .id <<< "$BODY"); then
+          echo "::warning::Could not create the GitHub deployment for ${TARGET_ENV}; continuing without a deployment record."
           exit 0
         fi
-        # The target line is tab-indented in upstream source: `\tgit fetch --unshallow origin`.
-        # Use `#` as the sed delimiter — the replacement contains `||` and `|` would be
-        # interpreted as the end-of-replacement separator (sed: unknown option to `s`).
-        sed -i 's#^\([[:space:]]*\)git fetch --unshallow origin$#\1git fetch --unshallow origin || true#' "${UPSTREAM_SCRIPT}"
-        if ! grep -qF 'git fetch --unshallow origin || true' "${UPSTREAM_SCRIPT}"; then
-          echo "::error::Sed patch did not apply. Upstream main.sh may have changed shape."
-          echo "Lines mentioning unshallow:"
-          grep -n 'unshallow' "${UPSTREAM_SCRIPT}" || true
-          exit 1
-        fi
-        echo "Patched upstream main.sh: prepare_site_root's --unshallow is now tolerant."
+        echo "GITHUB_DEPLOYMENT_ID=${ID}" >> "$GITHUB_ENV"
+        gh api -X POST "repos/${REPO}/deployments/${ID}/statuses" \
+          -f state=in_progress -f log_url="$LOG_URL" --silent \
+          || echo "::warning::Could not mark deployment ${ID} in progress."
+        echo "GitHub deployment ${ID} started for ${TARGET_ENV}."
 
+    - name: Configure SSH key
+      uses: webfactory/ssh-agent@v0.10.0
+      with:
+        ssh-private-key: ${{ inputs.ssh_key }}
+
+    - name: Set up host keys for Pantheon
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh_key }}
+      run: '"${PTP_SCRIPT}" setup_ssh_hostkeys'
+
+    - name: Check multidev limit
+      id: check_multidev_limit
+      if: ${{ !contains(fromJSON('["dev","test","live"]'), inputs.target_env) }}
+      shell: bash
+      env:
+        PANTHEON_SITE: ${{ inputs.site }}
+      run: '"${PTP_SCRIPT}" check_multidev_limit'
+
+    - name: Comment on PR if multidev limit reached
+      if: ${{ steps.check_multidev_limit.outputs.multidev_available == 'false' && github.event.pull_request.number }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        gh pr comment "${PR_NUMBER}" --body "⚠️ **Unable to create a Multidev environment**
+
+        Your Pantheon site has reached its Multidev limit. No environments are available for this deployment.
+
+        **Next steps:**
+        1. Delete unused Multidev environments via the Pantheon dashboard
+        2. Contact your Pantheon account team to increase your Multidev limit
+        3. Re-run this workflow once environments are available
+
+        For more information, see the [Pantheon Multidev documentation](https://pantheon.io/docs/multidev)."
+
+    - name: Abort deployment if multidev limit reached
+      if: ${{ steps.check_multidev_limit.outputs.multidev_available == 'false' }}
+      shell: bash
+      run: |
+        echo "::error::Aborting deployment: Multidev limit reached. Delete unused environments or contact Pantheon to increase your limit."
+        exit 1
+
+    - name: Configure Git user
+      shell: bash
+      env:
+        PANTHEON_GIT_USER_NAME: ${{ github.event.pull_request.user.login || github.actor }}
+        PANTHEON_GIT_USER_EMAIL: ${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.actor) }}
+      run: |
+        git config --global user.email "${PANTHEON_GIT_USER_EMAIL}"
+        git config --global user.name "${PANTHEON_GIT_USER_NAME}"
+
+    - name: Prepare site root
+      shell: bash
+      env:
+        SITE_ROOT: ''
+        PANTHEON_SITE: ${{ inputs.site }}
+        PANTHEON_SOURCE_ENV: ${{ inputs.source_env }}
+      run: '"${PTP_SCRIPT}" prepare_site_root'
+
+    # skip_build_tools path: create the multidev if missing, then
+    # `git push --force` HEAD to the env's branch. COMPOSER_NO_SECURITY_BLOCKING
+    # carried over from the action call; the audit gate runs earlier, in
+    # composer-audit.
     - name: Push to Pantheon
-      uses: pantheon-systems/push-to-pantheon@0.9.5
+      shell: bash
       env:
         COMPOSER_NO_SECURITY_BLOCKING: 1
-      with:
-        ssh_key: ${{ inputs.ssh_key }}
-        machine_token: ${{ inputs.machine_token }}
-        site: ${{ inputs.site }}
-        target_env: ${{ inputs.target_env }}
-        source_env: ${{ inputs.source_env }}
-        git_user_name: ${{ github.event.pull_request.user.login || github.actor }}
-        git_user_email: ${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.actor) }}
-        git_commit_message: ${{ inputs.commit_message }}
-        delete_old_environments: false
-        clone_content: false
-        # We build on GitHub and push to Pantheon, so we don't need the Build
-        # Tools plugin's create-on-Pantheon flow. The direct-git path is
-        # idempotent: it checks multidev existence before calling
-        # multidev:create, so re-pushes to an existing rc-/epr-/pr- multidev
-        # update the code instead of failing with "environment already exists".
-        skip_build_tools: true
+        PANTHEON_SITE: ${{ inputs.site }}
+        PANTHEON_SOURCE_ENV: ${{ inputs.source_env }}
+        PANTHEON_COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        SITE_ROOT: ''
+        SKIP_BUILD_TOOLS: 'true'
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUM: ${{ github.event.pull_request.number }}
+      run: '"${PTP_SCRIPT}" push_to_pantheon'
 
-    # Verify-after-push: pantheon-systems/push-to-pantheon@0.9.0 does NOT
-    # propagate the exit code from `git push`. When Pantheon rejects the push
-    # (SFTP mode, branch protection, lost-update race, etc.) the action still
-    # reports the step as success and bobheadxi/deployments@v1 (also invoked
-    # inside the upstream) marks the GitHub deployment "success". We compare
+    # Verify-after-push: upstream's main.sh does NOT propagate the exit code
+    # from `git push` (no `set -e`; push_to_pantheon ends `exit 0`). When
+    # Pantheon rejects the push (SFTP mode, branch protection, lost-update race,
+    # etc.) the step still reports success. We compare
     # the local HEAD we meant to push against the remote ref Pantheon now has,
     # and fail the workflow loudly if they don't match. Belt-and-braces:
     # catches the SFTP case our pre-flight already handles AND any future
     # silent-fail mode in the upstream action.
     #
-    # Requires the SSH agent loaded by the upstream's webfactory/ssh-agent
-    # step (SSH_AUTH_SOCK is in GITHUB_ENV, so it persists into this step).
+    # Requires the SSH agent loaded by the webfactory/ssh-agent step above
+    # (SSH_AUTH_SOCK is in GITHUB_ENV, so it persists into this step).
     - name: Verify push landed on Pantheon
       shell: bash
       env:
@@ -291,3 +386,35 @@ runs:
           exit 1
         fi
         echo "✅ Pantheon ${TARGET_ENV} (branch ${PANTHEON_BRANCH}) is at ${LOCAL_HEAD} as expected."
+
+    # Replaces upstream's "Update deployment status". Runs after verify-after-push
+    # (upstream's ran before it), so a silently rejected push now shows as a
+    # failed deployment instead of a green one. Best-effort, like the start step.
+    # job.status inside a composite action still reads "success" after one of
+    # the composite's own steps fails, so record the outcome with the status
+    # functions, which do see this action's steps.
+    - name: Record deployment failure
+      if: ${{ failure() && env.GITHUB_DEPLOYMENT_ID != '' }}
+      shell: bash
+      run: echo "PTP_DEPLOY_STATE=failure" >> "$GITHUB_ENV"
+
+    - name: Record deployment cancellation
+      if: ${{ cancelled() && env.GITHUB_DEPLOYMENT_ID != '' }}
+      shell: bash
+      run: echo "PTP_DEPLOY_STATE=inactive" >> "$GITHUB_ENV"
+
+    - name: Finish GitHub deployment
+      if: ${{ always() && env.GITHUB_DEPLOYMENT_ID != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        ENV_URL: https://${{ inputs.target_env }}-${{ inputs.site }}.pantheonsite.io
+        LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        STATE="${PTP_DEPLOY_STATE:-success}"
+        gh api -X POST "repos/${REPO}/deployments/${GITHUB_DEPLOYMENT_ID}/statuses" \
+          -f state="$STATE" -f environment_url="$ENV_URL" -f log_url="$LOG_URL" \
+          -F auto_inactive=true --silent \
+          && echo "GitHub deployment ${GITHUB_DEPLOYMENT_ID} marked ${STATE}." \
+          || echo "::warning::Could not update GitHub deployment ${GITHUB_DEPLOYMENT_ID} to ${STATE}."
