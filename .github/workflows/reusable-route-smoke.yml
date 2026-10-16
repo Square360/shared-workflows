@@ -204,6 +204,16 @@ jobs:
           echo "[$SECONDS s] requesting uli link (cold multidevs can take minutes on first drush bootstrap)..."
           LOGIN_URL=$(terminus drush "$SITE.$TARGET_ENV" -- uli --uri="$TARGET_URL" $ULI_OPTIONS 2>"$ULI_ERR" | grep -oE 'https?://[^[:space:]]+' | tail -1)
           echo "[$SECONDS s] uli returned"
+          # The configured account (ROUTE_SMOKE_ULI_OPTIONS, org default
+          # --name=s360sysadmin) does not exist on every site. When drush
+          # cannot load it, fall back to uid 1 instead of failing the gate;
+          # a blocked uid 1 still fails below with the hardened-site message.
+          if [[ -z "$LOGIN_URL" && -n "$ULI_OPTIONS" ]] && grep -qi "Unable to load user" "$ULI_ERR"; then
+            echo "::warning::uli account from uli_options ($ULI_OPTIONS) does not exist on $SITE.$TARGET_ENV; falling back to uid 1. Set repo variable ROUTE_SMOKE_ULI_OPTIONS to an account that exists on this site to silence this."
+            : >"$ULI_ERR"
+            LOGIN_URL=$(terminus drush "$SITE.$TARGET_ENV" -- uli --uri="$TARGET_URL" 2>"$ULI_ERR" | grep -oE 'https?://[^[:space:]]+' | tail -1)
+            echo "[$SECONDS s] uli (uid 1 fallback) returned"
+          fi
           if [[ -z "$LOGIN_URL" ]]; then
             if grep -qi "blocked" "$ULI_ERR"; then
               echo "::error::drush uli account is BLOCKED (hardened site — uid 1 is blocked by design). Fix: set repo or org variable ROUTE_SMOKE_ULI_OPTIONS to an unblocked admin account, e.g. --name=s360sysadmin. No caller-file edit needed."
