@@ -1,3 +1,10 @@
+# Release 4.14.6 (2026-10-16)
+
+### Bug Fixes
+
+* route-smoke: fall back to uid 1 when the configured uli account does not exist (#181) (e158055)
+* semantic-release: mint the App token with client-id; app-id is deprecated (#180) (bd26e35)
+
 # Release 4.14.5 (2026-10-13)
 
 ### Bug Fixes
