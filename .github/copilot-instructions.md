@@ -44,8 +44,7 @@ Standard secrets across all workflows:
 - Always include `description`, `required`, and `type`
 - Provide sensible defaults for optional inputs
 - `pantheon_site`: Always required string input
-- `slack_channel`: Optional string for Slack notifications (e.g., `#deployments`)
-- `slack_webhook_url`: Optional string for Slack webhook URL (organization variable)
+- `slack_channel`: Deprecated and ignored (kept so older callers don't fail; removed in v5). Notifications use the `CLICKUP_CHANNEL_ID` repository variable.
 
 ### 4. Environment Variable Patterns
 - Use `TERMINUS_MACHINE_TOKEN` for Terminus CLI authentication
@@ -120,32 +119,24 @@ export GITHUB_HEAD_REF=""
 export GITHUB_BASE_REF=""
 ```
 
-## Slack Notifications
+## ClickUp Channel Notifications
 
 ### 1. Configuration
-Slack notifications are optional and configured via inputs:
-- `slack_channel`: Channel name for notifications (e.g., `#deployments`)
-- `slack_webhook_url`: Organization variable containing webhook URL
+Every reusable posts to the client's ClickUp `<Client> [internal]` chat channel, named by the
+`CLICKUP_CHANNEL_ID` **repository variable** (e.g. `12b9zb-88811`). A reusable workflow reads the
+caller's `vars`, so callers pass nothing. No variable = no notification (a notice, never a failure).
+Posting goes through `.github/actions/clickup-notify` (v3 chat API, Markdown body) with the
+`op://s360-cicd/clickup/api-token` token, which is the Grimbert Talos CI account.
 
 ### 2. Notification Content
-Notifications include:
-- Deployment status (success/failure/cancelled)
-- Repository and environment information
-- Pantheon site details
-- Environment URL (on success)
-- Workflow link for troubleshooting
-- Pull request link (for multidev deployments)
+- Status headline with `site.env`
+- Ticket link (from branch / PR title), PR link, multidev or environment URL on success
+- Failed step and error on failure; composer audit, scan and VRT counts where they apply
+- Workflow run link
 
-### 3. Usage Pattern
-```yaml
-jobs:
-  deploy:
-    uses: Square360/shared-pantheon-workflows/.github/workflows/reusable-deploy-pantheon.yml@main
-    with:
-      pantheon_site: ${{ vars.PANTHEON_SITE }}
-      slack_channel: ${{ vars.SLACK_CHANNEL }}
-      slack_webhook_url: ${{ vars.SLACK_WEBHOOK_URL }}
-```
+PR and epic multidevs no longer comment on the ticket per build; the channel post links the
+ticket instead, and the ClickUp GitHub app shows PRs on the ticket natively. Route-smoke posts
+on failure only.
 
 ## Code Quality Standards
 

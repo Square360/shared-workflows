@@ -1,0 +1,57 @@
+name: 'ClickUp channel notify'
+description: >-
+  Posts a Markdown message to a ClickUp chat channel through the v3 chat API.
+  Replaces the Slack chat.postMessage calls: each client has a
+  "<Client> [internal]" channel, and the consuming repo names it with the
+  CLICKUP_CHANNEL_ID repository variable (a reusable workflow reads the
+  caller's vars, so no caller edit is needed). Never fails the job: a missing
+  channel, token or workspace is a notice, a failed post is a warning.
+
+inputs:
+  channel_id:
+    description: 'ClickUp chat channel ID, e.g. 12b9zb-88811. Pass vars.CLICKUP_CHANNEL_ID. Empty = skip with a notice.'
+    required: false
+    default: ''
+  token:
+    description: 'ClickUp API token (op://s360-cicd/clickup/api-token, the Grimbert Talos CI account)'
+    required: false
+    default: ''
+  workspace_id:
+    description: 'ClickUp workspace (team) ID (op://s360-cicd/clickup/team-id)'
+    required: false
+    default: ''
+  message:
+    description: 'Message body. ClickUp renders Markdown: **bold**, `code`, [text](url), - bullets.'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Post to ClickUp channel
+      shell: bash
+      env:
+        CHANNEL_ID: ${{ inputs.channel_id }}
+        CLICKUP_TOKEN: ${{ inputs.token }}
+        WORKSPACE_ID: ${{ inputs.workspace_id }}
+        MESSAGE: ${{ inputs.message }}
+      run: |
+        if [[ -z "$CHANNEL_ID" ]]; then
+          echo "::notice::No CLICKUP_CHANNEL_ID repository variable, skipping the ClickUp channel notification"
+          exit 0
+        fi
+        if [[ -z "$CLICKUP_TOKEN" || -z "$WORKSPACE_ID" ]]; then
+          echo "::warning::ClickUp token or workspace ID not loaded, skipping the ClickUp channel notification"
+          exit 0
+        fi
+        PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"type": "message", "content_format": "text/md", "content": os.environ["MESSAGE"]}))')
+        RESPONSE_FILE="${RUNNER_TEMP:-/tmp}/clickup_notify.json"
+        CODE=$(curl -s --max-time 30 --retry 2 -o "$RESPONSE_FILE" -w '%{http_code}' -X POST \
+          "https://api.clickup.com/api/v3/workspaces/${WORKSPACE_ID}/chat/channels/${CHANNEL_ID}/messages" \
+          -H "Authorization: ${CLICKUP_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "$PAYLOAD" || true)
+        if [[ "$CODE" == 2* ]]; then
+          echo "Posted to ClickUp channel ${CHANNEL_ID}"
+        else
+          echo "::warning::ClickUp channel post failed (HTTP ${CODE:-none}): $(head -c 300 "$RESPONSE_FILE" 2>/dev/null)"
+        fi

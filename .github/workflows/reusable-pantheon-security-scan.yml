@@ -6,9 +6,9 @@ name: Reusable Security Scan (OWASP ZAP Baseline)
 # Runs an OWASP ZAP baseline scan against a deployed Pantheon multidev. Uploads
 # HTML + JSON + Markdown reports to the same S3 bucket VRT uses (new prefix
 # /security/) and posts a summary to the PR, the GitHub job summary, and an
-# optional Slack channel. The ClickUp task comment is opt-in (clickup_comment:
+# client's ClickUp channel (CLICKUP_CHANNEL_ID). The ClickUp task comment is opt-in (clickup_comment:
 # true) — off by default since 2026-09-16 (S360-1077): one comment per RC build
-# swamped release tickets, and the run page + Slack already carry the result.
+# swamped release tickets, and the run page + channel already carry the result.
 #
 # Gating:
 #   - pr-*  multidevs: opt-in via [run-security], [run-security TASK-ID],
@@ -42,7 +42,7 @@ on:
         required: true
         type: string
       slack_channel:
-        description: 'Slack channel for notifications'
+        description: 'DEPRECATED, ignored. Notifications go to the ClickUp channel in the CLICKUP_CHANNEL_ID repository variable. Kept so callers that still pass it do not fail; removed in v5.'
         required: false
         type: string
       force_run:
@@ -56,7 +56,7 @@ on:
         type: string
         default: ''
       clickup_comment:
-        description: 'Post the scan summary as a comment on the resolved ClickUp task. Default false — the job summary and Slack carry the result (S360-1077).'
+        description: 'Post the scan summary as a comment on the resolved ClickUp task. Default false — the job summary and the ClickUp channel carry the result (S360-1077).'
         required: false
         type: boolean
         default: false
@@ -185,7 +185,6 @@ jobs:
         AWS_SECRET_ACCESS_KEY: op://s360-cicd/aws-ci/secret-access-key
         CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
         CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
-        SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
 
     - name: Install Terminus
       if: steps.sec_check.outputs.enabled == 'true'
@@ -410,7 +409,7 @@ jobs:
 
     # -------------------------------------------------------------------------
     # Summarise the ZAP JSON report into severity counts for use by the assert,
-    # PR comment, ClickUp comment, and Slack notify steps.
+    # PR comment, ClickUp comment, and channel notify steps.
     # -------------------------------------------------------------------------
     - name: Summarise ZAP findings
       id: summarise
@@ -799,16 +798,16 @@ jobs:
         echo "✅ Severity assertion passed (mode: ${SEVERITY_MODE}, High: ${HIGH})"
 
     # -------------------------------------------------------------------------
-    # Slack notification. Runs always() so a failed rc-* assert still notifies.
+    # ClickUp channel notification (replaces Slack). Runs always() so a failed
+    # rc-* assert still notifies. Channel = CLICKUP_CHANNEL_ID repo variable.
     # -------------------------------------------------------------------------
-    - name: Notify Slack
+    - name: Build ClickUp message
+      id: notify_message
       if: >
         always() &&
         steps.sec_check.outputs.enabled == 'true' &&
-        inputs.slack_channel != ''
+        vars.CLICKUP_CHANNEL_ID != ''
       env:
-        SLACK_BOT_TOKEN:  ${{ env.SLACK_BOT_TOKEN }}
-        SLACK_CHANNEL:    ${{ inputs.slack_channel }}
         REPORT_HTML_URL:  ${{ steps.s3_upload.outputs.report_html_url }}
         REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
         TARGET_ENV:       ${{ inputs.target_env }}
@@ -820,75 +819,45 @@ jobs:
         TOTAL:            ${{ steps.summarise.outputs.total }}
         SEVERITY_MODE:    ${{ steps.sec_check.outputs.severity_mode }}
         SCAN_STATUS:      ${{ steps.summarise.outputs.scan_status }}
+        TASK_ID:          ${{ steps.sec_check.outputs.clickup_task_id }}
+        PR_NUMBER:        ${{ github.event.pull_request.number }}
+        REPO:             ${{ github.repository }}
+        RUN_ID:           ${{ github.run_id }}
       run: |
-        if [[ -z "$SLACK_BOT_TOKEN" ]]; then
-          echo "SLACK_BOT_TOKEN not set — skipping Slack notification"
-          exit 0
-        fi
-
         if [[ "$SCAN_STATUS" == "inconclusive" ]]; then
-          STATUS_EMOJI=":warning:"
-          STATUS_COLOR="warning"
-          STATUS_TEXT="Inconclusive — target unreachable during scan"
+          HEADLINE="⚠️ **Security scan inconclusive**: target unreachable during scan"
         elif [[ "$SCAN_STATUS" == "missing_report" ]]; then
-          STATUS_EMOJI=":warning:"
-          STATUS_COLOR="warning"
-          STATUS_TEXT="Inconclusive — ZAP produced no report"
+          HEADLINE="⚠️ **Security scan inconclusive**: ZAP produced no report"
         elif [[ "$TOTAL" == "0" ]]; then
-          STATUS_EMOJI=":white_check_mark:"
-          STATUS_COLOR="good"
-          STATUS_TEXT="No findings"
+          HEADLINE="✅ **Security scan: no findings**"
         elif [[ "$HIGH" != "0" && "$SEVERITY_MODE" == "strict" ]]; then
-          STATUS_EMOJI=":x:"
-          STATUS_COLOR="danger"
-          STATUS_TEXT="${HIGH} High finding(s) — RC gate failed"
+          HEADLINE="❌ **Security scan: ${HIGH} High finding(s), RC gate failed**"
         elif [[ "$HIGH" != "0" ]]; then
-          STATUS_EMOJI=":warning:"
-          STATUS_COLOR="warning"
-          STATUS_TEXT="${HIGH} High finding(s) — review before merge"
+          HEADLINE="⚠️ **Security scan: ${HIGH} High finding(s), review before merge**"
         else
-          STATUS_EMOJI=":information_source:"
-          STATUS_COLOR="#808080"
-          STATUS_TEXT="${TOTAL} finding(s) (informational)"
+          HEADLINE="ℹ️ **Security scan: ${TOTAL} finding(s)** (informational)"
         fi
 
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        REPO="${{ github.repository }}"
-        PR_FIELD=""
-        if [[ -n "$PR_NUMBER" ]]; then
-          PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": true}"
-        fi
+        LINES=("${HEADLINE} · \`${PANTHEON_SITE}.${TARGET_ENV}\`" "")
+        LINES+=("- **Findings:** High ${HIGH:-0} · Medium ${MEDIUM:-0} · Low ${LOW:-0} · Info ${INFO:-0}")
+        [[ -n "$TASK_ID" ]] && LINES+=("- **Ticket:** [${TASK_ID}](https://app.clickup.com/t/${CLICKUP_TEAM_ID}/${TASK_ID})")
+        [[ -n "$PR_NUMBER" ]] && LINES+=("- **Pull request:** [${REPO}#${PR_NUMBER}](https://github.com/${REPO}/pull/${PR_NUMBER})")
+        [[ -n "$REPORT_HTML_URL" ]] && LINES+=("- **Report:** [full report](${REPORT_HTML_URL})")
+        [[ -n "$REPORT_JSON_URL" ]] && LINES+=("- **AI-readable JSON:** [report_json.json](${REPORT_JSON_URL})")
+        LINES+=("- [Workflow run](https://github.com/${REPO}/actions/runs/${RUN_ID})")
+        LINES+=("" "_Baseline scans are passive checks against the running multidev. Findings flag potential issues, not all are bugs: prioritise High-severity findings and verify each in context. Configuration drift (missing security headers, cookie flags) is often the highest-value signal._")
 
-        REPORT_FIELD=""
-        if [[ -n "$REPORT_HTML_URL" ]]; then
-          REPORT_FIELD=",{\"title\": \"Report\", \"value\": \"<${REPORT_HTML_URL}|View Full Report>\", \"short\": false}"
-        fi
+        {
+          echo 'body<<__CLICKUP_MSG__'
+          printf '%s\n' "${LINES[@]}"
+          echo '__CLICKUP_MSG__'
+        } >> "$GITHUB_OUTPUT"
 
-        REPORT_JSON_FIELD=""
-        if [[ -n "$REPORT_JSON_URL" ]]; then
-          REPORT_JSON_FIELD=",{\"title\": \"AI-readable JSON\", \"value\": \"<${REPORT_JSON_URL}|report_json.json>\", \"short\": false}"
-        fi
-
-        NOTE_FIELD=",{\"title\": \"Security scan interpretation note\", \"value\": \"Baseline scans are passive checks against the running multidev. Findings flag potential issues — not all are bugs. Reviewers should prioritise High-severity findings and verify each in context. Configuration drift (missing security headers, cookie flags) is often the highest-value signal here.\", \"short\": false}"
-
-        curl -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-          -H 'Content-type: application/json; charset=utf-8' \
-          --data "{
-            \"channel\": \"${SLACK_CHANNEL}\",
-            \"text\": \"${STATUS_EMOJI} OWASP ZAP Baseline Scan — ${STATUS_TEXT}\",
-            \"attachments\": [{
-              \"color\": \"${STATUS_COLOR}\",
-              \"fields\": [
-                {\"title\": \"Site\",        \"value\": \"${PANTHEON_SITE}\", \"short\": true},
-                {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\",    \"short\": true},
-                {\"title\": \"Findings\",    \"value\": \"High: ${HIGH}  ·  Medium: ${MEDIUM}  ·  Low: ${LOW}  ·  Info: ${INFO}\", \"short\": false}
-                ${PR_FIELD}
-                ${REPORT_FIELD}
-                ${REPORT_JSON_FIELD}
-                ${NOTE_FIELD}
-              ],
-              \"footer\": \"GitHub Actions\",
-              \"ts\": $(date +%s)
-            }]
-          }" \
-          https://slack.com/api/chat.postMessage
+    - name: Post to ClickUp channel
+      if: steps.notify_message.outcome == 'success'
+      uses: Square360/shared-workflows/.github/actions/clickup-notify@v4  # moving major tag; new in 4.15.0
+      with:
+        channel_id: ${{ vars.CLICKUP_CHANNEL_ID }}
+        token: ${{ env.CLICKUP_API_TOKEN }}
+        workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+        message: ${{ steps.notify_message.outputs.body }}
