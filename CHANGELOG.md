@@ -1,3 +1,9 @@
+# Release 4.15.0 (2026-10-20)
+
+### Features
+
+* post CI notifications to ClickUp channels instead of Slack (#183) (8f88602)
+
 # Release 4.14.6 (2026-10-16)
 
 ### Bug Fixes
