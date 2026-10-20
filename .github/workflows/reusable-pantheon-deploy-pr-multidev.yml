@@ -6,7 +6,10 @@ name: Reusable Deploy to PR Multidev (Pantheon)
 #
 # Defaults:
 #   - source_env: dev (PR multidevs are always cloned from dev)
-#   - ClickUp comment label: "WIP Multidev"
+#   - Notifications: the client's ClickUp "[internal]" channel, named by the
+#     CLICKUP_CHANNEL_ID repository variable (replaces Slack). The channel post
+#     carries the ticket, PR and multidev links; the ticket gets no per-build
+#     comment.
 #   - GitHub PR comment with the multidev URL
 #   - Security scan: opt-in via [run-security] (or legacy [security]) in PR body
 #   - VRT: opt-in via the --run-vrt PR label (preferred) or [run-vrt]/[vrt] in PR body
@@ -33,7 +36,7 @@ on:
         required: true
         type: string
       slack_channel:
-        description: 'Slack channel for notifications (e.g. #deployments)'
+        description: 'DEPRECATED, ignored. Notifications go to the ClickUp channel in the CLICKUP_CHANNEL_ID repository variable. Kept so callers that still pass it do not fail; removed in v5.'
         required: false
         type: string
       workflow_skip_terminus:
@@ -111,6 +114,7 @@ jobs:
       target_env: ${{ steps.derive.outputs.target_env }}
       multidev_url: ${{ steps.multidev_url.outputs.url }}
       env_is_new: ${{ steps.check_env.outputs.env_is_new }}
+      task_id: ${{ steps.task_id.outputs.task_id }}
       error_message: ${{ steps.capture_error.outputs.error_message }}
       failed_step: ${{ steps.capture_error.outputs.failed_step }}
     steps:
@@ -131,8 +135,6 @@ jobs:
         env:
           PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
           PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
-          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
-          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
       - name: Derive multidev name from PR number
         id: derive
@@ -153,10 +155,10 @@ jobs:
           echo "Checking if ${SITE}.${TARGET_ENV} exists..."
           if terminus env:info "${SITE}.${TARGET_ENV}" >/dev/null 2>&1; then
             echo "env_is_new=false" >> $GITHUB_OUTPUT
-            echo "Multidev exists, ClickUp comment will say 'updated'"
+            echo "Multidev exists, notification will say 'updated'"
           else
             echo "env_is_new=true" >> $GITHUB_OUTPUT
-            echo "Multidev is new, ClickUp comment will say 'created'"
+            echo "Multidev is new, notification will say 'created'"
           fi
 
       - name: Push code to Pantheon multidev
@@ -203,45 +205,19 @@ jobs:
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "Multidev available at: $URL"
 
-      - name: Comment on ClickUp task with multidev URL
-        continue-on-error: true
+      # The per-build ticket comment moved to the client's ClickUp channel
+      # (notify_clickup below); the task ID makes the post link the ticket.
+      # PR links reach the ticket natively through the ClickUp GitHub app.
+      - name: Resolve ClickUp task ID
+        id: task_id
+        if: ${{ always() }}
         env:
-          CLICKUP_API_TOKEN: ${{ env.CLICKUP_API_TOKEN }}
-          CLICKUP_TEAM_ID: ${{ env.CLICKUP_TEAM_ID }}
-          MULTIDEV_URL: ${{ steps.multidev_url.outputs.url }}
-          TARGET_ENV: ${{ steps.derive.outputs.target_env }}
-          ENV_IS_NEW: ${{ steps.check_env.outputs.env_is_new }}
           PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
           BRANCH: ${{ github.head_ref }}
-          SITE: ${{ inputs.pantheon_site }}
         run: |
-          if [[ -z "$CLICKUP_API_TOKEN" || -z "$CLICKUP_TEAM_ID" ]]; then
-            echo "CLICKUP_API_TOKEN or CLICKUP_TEAM_ID not set, skipping ClickUp comment"
-            exit 0
-          fi
           TASK_ID=$(echo "$BRANCH $PR_TITLE" | grep -oP '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
-          if [[ -z "$TASK_ID" ]]; then
-            echo "No ClickUp task ID found in branch or PR title, skipping comment"
-            exit 0
-          fi
-          echo "Found ClickUp task ID: $TASK_ID"
-          ACTION=$([[ "$ENV_IS_NEW" == "true" ]] && echo "created" || echo "updated")
-          PR_LINE=""
-          if [[ -n "$PR_NUMBER" ]]; then
-            PR_LINE="\nPull Request: https://github.com/${REPO}/pull/${PR_NUMBER}"
-          fi
-          RESPONSE=$(curl -s -o /tmp/clickup_response.json -w "%{http_code}" -X POST \
-            "https://api.clickup.com/api/v2/task/${TASK_ID}/comment?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}" \
-            -H "Authorization: ${CLICKUP_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"comment_text\": \"The WIP Multidev environment was ${ACTION}: ${MULTIDEV_URL}\n\nEnvironment: ${TARGET_ENV}\nSite: ${SITE}${PR_LINE}\"}" || true)
-          echo "ClickUp API response code: $RESPONSE"
-          cat /tmp/clickup_response.json || true
-          if [[ "$RESPONSE" != "200" ]]; then
-            echo "Warning: ClickUp comment may not have been posted (HTTP $RESPONSE)"
-          fi
+          echo "task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+          echo "ClickUp task ID: ${TASK_ID:-none}"
 
       - name: Comment on PR with multidev URL
         # Gate on success() so the "🚀 Multidev Environment Ready!" comment
@@ -310,7 +286,6 @@ jobs:
     with:
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
-      slack_channel: ${{ inputs.slack_channel }}
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
@@ -331,7 +306,6 @@ jobs:
       clickup_comment: ${{ inputs.clickup_comment }}
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
-      slack_channel: ${{ inputs.slack_channel }}
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
@@ -351,14 +325,15 @@ jobs:
       clickup_comment: ${{ inputs.clickup_comment }}
       pantheon_site: ${{ inputs.pantheon_site }}
       target_env: ${{ needs.deploy_pr_multidev.outputs.target_env }}
-      slack_channel: ${{ inputs.slack_channel }}
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
-  notify_slack:
-    name: Notify Slack
+  notify_clickup:
+    name: Notify ClickUp
     needs: deploy_pr_multidev
-    if: ${{ always() && inputs.slack_channel }}
+    # Posts to the client's "[internal]" ClickUp channel named by the
+    # CLICKUP_CHANNEL_ID repository variable (replaces the Slack notice).
+    if: ${{ always() && vars.CLICKUP_CHANNEL_ID != '' }}
     runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
@@ -371,13 +346,15 @@ jobs:
         with:
           export-env: true
         env:
-          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
-      - name: Send Slack notification
+      - name: Build message
+        id: message
         env:
-          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ inputs.slack_channel }}
           DEPLOY_RESULT: ${{ needs.deploy_pr_multidev.result }}
+          ENV_IS_NEW: ${{ needs.deploy_pr_multidev.outputs.env_is_new }}
+          TASK_ID: ${{ needs.deploy_pr_multidev.outputs.task_id }}
           MULTIDEV_URL: ${{ needs.deploy_pr_multidev.outputs.multidev_url }}
           TARGET_ENV: ${{ needs.deploy_pr_multidev.outputs.target_env }}
           FAILED_STEP: ${{ needs.deploy_pr_multidev.outputs.failed_step }}
@@ -388,59 +365,36 @@ jobs:
           SITE: ${{ inputs.pantheon_site }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
-            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
-            exit 0
-          fi
-
-          # Status decoding
+          ACTION=$([[ "$ENV_IS_NEW" == "true" ]] && echo "created" || echo "updated")
           case "$DEPLOY_RESULT" in
-            success)   STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success"   ;;
-            failure)   STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed"    ;;
-            cancelled) STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled" ;;
-            skipped)   STATUS_EMOJI=":fast_forward:";     STATUS_COLOR="#808080"; STATUS_TEXT="Skipped"   ;;
-            *)         STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown"   ;;
+            success)   HEADLINE="✅ **PR multidev ${ACTION}**" ;;
+            failure)   HEADLINE="❌ **PR multidev deployment failed**" ;;
+            cancelled) HEADLINE="⚠️ **PR multidev deployment cancelled**" ;;
+            skipped)   HEADLINE="⏩ **PR multidev deployment skipped**" ;;
+            *)         HEADLINE="❓ **PR multidev deployment: ${DEPLOY_RESULT:-unknown}**" ;;
           esac
 
-          ENV_URL_FIELD=""
+          LINES=("${HEADLINE} · \`${SITE}.${TARGET_ENV:-pr-${PR_NUMBER}}\`" "")
+          [[ -n "$TASK_ID" ]] && LINES+=("- **Ticket:** [${TASK_ID}](https://app.clickup.com/t/${CLICKUP_TEAM_ID}/${TASK_ID})")
+          [[ -n "$PR_NUMBER" ]] && LINES+=("- **Pull request:** [${REPO}#${PR_NUMBER}](https://github.com/${REPO}/pull/${PR_NUMBER}) ${PR_TITLE}")
           if [[ "$DEPLOY_RESULT" == "success" && -n "$MULTIDEV_URL" ]]; then
-            ENV_URL_FIELD=",{\"title\": \"Multidev URL\", \"value\": \"<${MULTIDEV_URL}|${MULTIDEV_URL}>\", \"short\": false}"
+            LINES+=("- **Multidev:** ${MULTIDEV_URL}")
           fi
-
-          PR_FIELD=""
-          if [[ -n "$PR_NUMBER" ]]; then
-            PR_TITLE_ESCAPED=$(printf '%s' "$PR_TITLE" | jq -Rs .)
-            PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": false},{\"title\": \"PR Title\", \"value\": ${PR_TITLE_ESCAPED}, \"short\": false}"
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" ]]; then
+            LINES+=("- **Failed step:** ${FAILED_STEP}: ${ERROR_MESSAGE}")
           fi
+          LINES+=("- [Workflow run](https://github.com/${REPO}/actions/runs/${RUN_ID})")
 
-          ERROR_FIELD=""
-          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
-            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
-            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
-            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
-          fi
+          {
+            echo 'body<<__CLICKUP_MSG__'
+            printf '%s\n' "${LINES[@]}"
+            echo '__CLICKUP_MSG__'
+          } >> "$GITHUB_OUTPUT"
 
-          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H 'Content-type: application/json; charset=utf-8' \
-            --data "{
-              \"channel\": \"${SLACK_CHANNEL}\",
-              \"text\": \"${STATUS_EMOJI} PR Multidev Deployment ${STATUS_TEXT}\",
-              \"attachments\": [
-                {
-                  \"color\": \"${STATUS_COLOR}\",
-                  \"fields\": [
-                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
-                    {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\", \"short\": true},
-                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
-                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
-                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
-                    ${ENV_URL_FIELD}
-                    ${PR_FIELD}
-                    ${ERROR_FIELD}
-                  ],
-                  \"footer\": \"GitHub Actions\",
-                  \"ts\": $(date +%s)
-                }
-              ]
-            }" \
-            https://slack.com/api/chat.postMessage
+      - name: Post to ClickUp channel
+        uses: Square360/shared-workflows/.github/actions/clickup-notify@v4  # moving major tag; new in 4.15.0
+        with:
+          channel_id: ${{ vars.CLICKUP_CHANNEL_ID }}
+          token: ${{ env.CLICKUP_API_TOKEN }}
+          workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+          message: ${{ steps.message.outputs.body }}

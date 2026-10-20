@@ -39,7 +39,7 @@ name: Reusable Deploy to Pantheon DEV
 #
 # v4: secrets loaded from 1Password via OP_SERVICE_ACCOUNT_TOKEN.
 #     The only GitHub secret required is OP_SERVICE_ACCOUNT_TOKEN (org-level).
-#     All other credentials (Pantheon, Slack) are resolved at runtime from
+#     All other credentials (Pantheon, ClickUp) are resolved at runtime from
 #     the s360-cicd vault.
 # -----------------------------------------------------------------------------
 
@@ -66,7 +66,7 @@ on:
         type: boolean
         default: true
       slack_channel:
-        description: 'Slack channel for notifications (e.g. #deployments)'
+        description: 'DEPRECATED, ignored. Notifications go to the ClickUp channel in the CLICKUP_CHANNEL_ID repository variable. Kept so callers that still pass it do not fail; removed in v5.'
         required: false
         type: string
       workflow_skip_terminus:
@@ -362,10 +362,12 @@ jobs:
             echo "error_message=Dev deployment failed at an unknown step. Check the workflow logs." >> "$GITHUB_OUTPUT"
           fi
 
-  notify_slack:
-    name: Notify Slack
+  notify_clickup:
+    name: Notify ClickUp
     needs: [composer_audit, semantic_release, deploy_to_pantheon_dev, skip_gate]
-    if: ${{ always() && inputs.slack_channel }}
+    # Posts to the client's "[internal]" ClickUp channel named by the
+    # CLICKUP_CHANNEL_ID repository variable (replaces the Slack notice).
+    if: ${{ always() && vars.CLICKUP_CHANNEL_ID != '' }}
     runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Configure 1Password
@@ -378,12 +380,12 @@ jobs:
         with:
           export-env: true
         env:
-          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
-      - name: Send Slack notification
+      - name: Build message
+        id: message
         env:
-          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ inputs.slack_channel }}
           AUDIT_RESULT: ${{ needs.composer_audit.result }}
           AUDIT_ADVISORIES: ${{ needs.composer_audit.outputs.advisory_count }}
           AUDIT_BLOCKING: ${{ needs.composer_audit.outputs.blocking_count }}
@@ -399,84 +401,61 @@ jobs:
           SITE: ${{ inputs.pantheon_site }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          if [[ -z "$SLACK_BOT_TOKEN" ]]; then
-            echo "SLACK_BOT_TOKEN not provided, skipping Slack notification"
-            exit 0
-          fi
-
-          # Decide overall status. Semantic-release failure takes precedence
-          # because deploy is gated on semantic_release succeeding or being
-          # skipped — a failure there means the deploy never ran.
+          # Overall status. Audit and semantic-release failures take precedence:
+          # the deploy is gated on both, so a failure there means it never ran.
           if [[ "$AUDIT_RESULT" == "failure" ]]; then
-            STATUS_EMOJI=":no_entry:";         STATUS_COLOR="danger";  STATUS_TEXT="Blocked by security advisories"; PHASE="Composer audit"
+            HEADLINE="⛔ **DEV deployment blocked by security advisories**"
           elif [[ "$SEMANTIC_RESULT" == "failure" ]]; then
-            STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed";    PHASE="Semantic Release"
+            HEADLINE="❌ **DEV deployment failed** (semantic release)"
           elif [[ "$DEPLOY_RESULT" == "success" ]]; then
-            STATUS_EMOJI=":white_check_mark:"; STATUS_COLOR="good";    STATUS_TEXT="Success";   PHASE="Deployment"
+            HEADLINE="✅ **DEV deployment succeeded**"
           elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
-            STATUS_EMOJI=":x:";                STATUS_COLOR="danger";  STATUS_TEXT="Failed";    PHASE="Deployment"
+            HEADLINE="❌ **DEV deployment failed**"
           elif [[ "$DEPLOY_RESULT" == "cancelled" ]]; then
-            STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled"; PHASE="Deployment"
+            HEADLINE="⚠️ **DEV deployment cancelled**"
           elif [[ "$DEPLOY_RESULT" == "skipped" && "$GATE_DEPLOY" == "false" ]]; then
-            STATUS_EMOJI=":fast_forward:";     STATUS_COLOR="#808080"; STATUS_TEXT="Skipped (docs/tooling label)"; PHASE="Deployment"
+            HEADLINE="⏩ **DEV deployment skipped** (docs/tooling label)"
           elif [[ "$SEMANTIC_RESULT" == "cancelled" ]]; then
-            STATUS_EMOJI=":warning:";          STATUS_COLOR="warning"; STATUS_TEXT="Cancelled"; PHASE="Semantic Release"
+            HEADLINE="⚠️ **DEV deployment cancelled** (semantic release)"
           else
-            STATUS_EMOJI=":question:";         STATUS_COLOR="#808080"; STATUS_TEXT="Unknown";   PHASE="Unknown"
+            HEADLINE="❓ **DEV deployment: unknown status**"
           fi
 
-          ENV_URL_FIELD=""
+          LINES=("${HEADLINE} · \`${SITE}.dev\`" "")
+          LINES+=("- **Repository:** ${REPO}")
           if [[ "$DEPLOY_RESULT" == "success" && -n "$ENV_URL" ]]; then
-            ENV_URL_FIELD=",{\"title\": \"Environment URL\", \"value\": \"<${ENV_URL}|${ENV_URL}>\", \"short\": false}"
+            LINES+=("- **Environment:** ${ENV_URL}")
           fi
-
-          # Backup duration on success (S360-1076) — slow sites become visible.
-          BACKUP_FIELD=""
+          # Backup duration on success (S360-1076): slow sites become visible.
           if [[ "$DEPLOY_RESULT" == "success" && -n "$BACKUP_SECONDS" ]]; then
-            BACKUP_FIELD=",{\"title\": \"LIVE backup\", \"value\": \"took $((BACKUP_SECONDS/60))m$((BACKUP_SECONDS%60))s\", \"short\": true}"
+            LINES+=("- **LIVE backup:** took $((BACKUP_SECONDS/60))m$((BACKUP_SECONDS%60))s")
           fi
-
-          AUDIT_FIELD=""
           if [[ "$AUDIT_RESULT" == "success" ]]; then
             if [[ "${AUDIT_ADVISORIES:-0}" -gt 0 ]]; then
-              AUDIT_FIELD=",{\"title\": \"Composer audit\", \"value\": \":warning: ${AUDIT_ADVISORIES} advisor(y/ies), none blocking\", \"short\": true}"
+              LINES+=("- **Composer audit:** ⚠️ ${AUDIT_ADVISORIES} advisor(y/ies), none blocking")
             else
-              AUDIT_FIELD=",{\"title\": \"Composer audit\", \"value\": \":white_check_mark: clean\", \"short\": true}"
+              LINES+=("- **Composer audit:** ✅ clean")
             fi
           fi
-
-          ERROR_FIELD=""
-          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" && -n "$ERROR_MESSAGE" ]]; then
-            FAILED_STEP_ESCAPED=$(printf '%s' "$FAILED_STEP" | jq -Rs .)
-            ERROR_MSG_ESCAPED=$(printf '%s' "$ERROR_MESSAGE" | jq -Rs .)
-            ERROR_FIELD=",{\"title\": \"Failed Step\", \"value\": ${FAILED_STEP_ESCAPED}, \"short\": true},{\"title\": \"Error Details\", \"value\": ${ERROR_MSG_ESCAPED}, \"short\": false}"
+          if [[ "$DEPLOY_RESULT" == "failure" && -n "$FAILED_STEP" ]]; then
+            LINES+=("- **Failed step:** ${FAILED_STEP}: ${ERROR_MESSAGE}")
           elif [[ "$AUDIT_RESULT" == "failure" ]]; then
-            ERROR_FIELD=",{\"title\": \"Error Details\", \"value\": \"${AUDIT_BLOCKING:-?} blocking security advisor(y/ies) in composer.lock. Nothing was released or deployed. Update the packages, or set the COMPOSER_AUDIT_GATE=false repo variable for a deliberate override.\", \"short\": false}"
+            LINES+=("- **Details:** ${AUDIT_BLOCKING:-?} blocking security advisor(y/ies) in composer.lock. Nothing was released or deployed. Update the packages, or set the COMPOSER_AUDIT_GATE=false repo variable for a deliberate override.")
           elif [[ "$SEMANTIC_RESULT" == "failure" ]]; then
-            ERROR_FIELD=",{\"title\": \"Error Details\", \"value\": \"Semantic release failed. Deployment was not attempted. Check the workflow logs.\", \"short\": false}"
+            LINES+=("- **Details:** Semantic release failed. Deployment was not attempted.")
           fi
+          LINES+=("- [Workflow run](https://github.com/${REPO}/actions/runs/${RUN_ID})")
 
-          curl -X POST -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H 'Content-type: application/json; charset=utf-8' \
-            --data "{
-              \"channel\": \"${SLACK_CHANNEL}\",
-              \"text\": \"${STATUS_EMOJI} DEV Deployment ${STATUS_TEXT}\",
-              \"attachments\": [
-                {
-                  \"color\": \"${STATUS_COLOR}\",
-                  \"fields\": [
-                    {\"title\": \"Repository\", \"value\": \"${REPO}\", \"short\": true},
-                    {\"title\": \"Environment\", \"value\": \"dev\", \"short\": true},
-                    {\"title\": \"Site\", \"value\": \"${SITE}\", \"short\": true},
-                    {\"title\": \"Status\", \"value\": \"${STATUS_TEXT}\", \"short\": true},
-                    {\"title\": \"Phase\", \"value\": \"${PHASE}\", \"short\": true},
-                    {\"title\": \"Workflow\", \"value\": \"<https://github.com/${REPO}/actions/runs/${RUN_ID}|View Workflow>\", \"short\": false}
-                    ${ENV_URL_FIELD}${BACKUP_FIELD}${AUDIT_FIELD}
-                    ${ERROR_FIELD}
-                  ],
-                  \"footer\": \"GitHub Actions\",
-                  \"ts\": $(date +%s)
-                }
-              ]
-            }" \
-            https://slack.com/api/chat.postMessage
+          {
+            echo 'body<<__CLICKUP_MSG__'
+            printf '%s\n' "${LINES[@]}"
+            echo '__CLICKUP_MSG__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to ClickUp channel
+        uses: Square360/shared-workflows/.github/actions/clickup-notify@v4  # moving major tag; new in 4.15.0
+        with:
+          channel_id: ${{ vars.CLICKUP_CHANNEL_ID }}
+          token: ${{ env.CLICKUP_API_TOKEN }}
+          workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+          message: ${{ steps.message.outputs.body }}

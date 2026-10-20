@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       slack_channel:
-        description: 'Slack channel for notifications'
+        description: 'DEPRECATED, ignored. Notifications go to the ClickUp channel in the CLICKUP_CHANNEL_ID repository variable. Kept so callers that still pass it do not fail; removed in v5.'
         required: false
         type: string
       force_run:
@@ -26,7 +26,7 @@ on:
         type: string
         default: ''
       # Off by default since 2026-09-16 (S360-1077): the run page (job summary)
-      # and Slack carry the result; per-build ClickUp comments swamped release tickets.
+      # and the ClickUp channel carry the result; per-build ClickUp comments swamped release tickets.
       clickup_comment:
         description: 'Post the VRT summary as a comment on the resolved ClickUp task. Default false.'
         required: false
@@ -169,7 +169,6 @@ jobs:
         AWS_SECRET_ACCESS_KEY: op://s360-cicd/aws-ci/secret-access-key
         CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
         CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
-        SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
 
     - name: Install Terminus
       if: steps.vrt_check.outputs.enabled == 'true'
@@ -1000,78 +999,56 @@ jobs:
         echo "✅ VRT assertion passed"
 
     # Runs after assert (even on failure) so fail_on_diff jobs still notify.
-    - name: Notify Slack
+    # ClickUp channel = CLICKUP_CHANNEL_ID repo variable (replaces Slack).
+    - name: Build ClickUp message
+      id: notify_message
       if: >
         always() &&
         steps.vrt_check.outputs.enabled == 'true' &&
         steps.run_vrt.conclusion == 'success' &&
-        inputs.slack_channel != ''
+        vars.CLICKUP_CHANNEL_ID != ''
       env:
-        SLACK_BOT_TOKEN:  ${{ env.SLACK_BOT_TOKEN }}
-        SLACK_CHANNEL:    ${{ inputs.slack_channel }}
         REPORT_URL:       ${{ steps.s3_upload.outputs.report_url }}
         REPORT_JSON_URL:  ${{ steps.s3_upload.outputs.report_json_url }}
         TARGET_ENV:       ${{ inputs.target_env }}
         PANTHEON_SITE:    ${{ inputs.pantheon_site }}
+        TASK_ID:          ${{ steps.vrt_check.outputs.clickup_task_id }}
+        PR_NUMBER:        ${{ github.event.pull_request.number }}
+        REPO:             ${{ github.repository }}
+        RUN_ID:           ${{ github.run_id }}
       run: |
-        if [[ -z "$SLACK_BOT_TOKEN" ]]; then
-          echo "SLACK_BOT_TOKEN not set — skipping Slack notification"
-          exit 0
-        fi
-
         ALL_PASSED=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.allPassed)")
         PASS_COUNT=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.passCount)")
         FAIL_COUNT=$(node -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.failCount)")
         THRESHOLD=$(node  -e "const s=JSON.parse(require('fs').readFileSync('vrt-summary.json')); console.log(s.thresholdPercent)")
 
         if [[ "$ALL_PASSED" == "true" ]]; then
-          STATUS_EMOJI=":white_check_mark:"
-          STATUS_COLOR="good"
-          STATUS_TEXT="All checks passed"
+          HEADLINE="✅ **Visual regression: all checks passed**"
         else
-          STATUS_EMOJI=":x:"
-          STATUS_COLOR="danger"
-          STATUS_TEXT="Some checks failed"
+          HEADLINE="❌ **Visual regression: some checks failed**"
         fi
 
-        PR_NUMBER="${{ github.event.pull_request.number }}"
-        REPO="${{ github.repository }}"
-        PR_FIELD=""
-        if [[ -n "$PR_NUMBER" ]]; then
-          PR_FIELD=",{\"title\": \"Pull Request\", \"value\": \"<https://github.com/${REPO}/pull/${PR_NUMBER}|#${PR_NUMBER}>\", \"short\": true}"
-        fi
-
-        REPORT_FIELD=""
-        if [[ -n "$REPORT_URL" ]]; then
-          REPORT_FIELD=",{\"title\": \"Report\", \"value\": \"<${REPORT_URL}|View Full Report>\", \"short\": false}"
-        fi
-
-        REPORT_JSON_FIELD=""
-        if [[ -n "$REPORT_JSON_URL" ]]; then
-          REPORT_JSON_FIELD=",{\"title\": \"AI-readable JSON\", \"value\": \"<${REPORT_JSON_URL}|report.json>\", \"short\": false}"
-        fi
-
+        LINES=("${HEADLINE} · \`${PANTHEON_SITE}.${TARGET_ENV}\`" "")
+        LINES+=("- **Results:** ${PASS_COUNT} passed, ${FAIL_COUNT} failed (threshold ${THRESHOLD}%)")
+        [[ -n "$TASK_ID" ]] && LINES+=("- **Ticket:** [${TASK_ID}](https://app.clickup.com/t/${CLICKUP_TEAM_ID}/${TASK_ID})")
+        [[ -n "$PR_NUMBER" ]] && LINES+=("- **Pull request:** [${REPO}#${PR_NUMBER}](https://github.com/${REPO}/pull/${PR_NUMBER})")
+        [[ -n "$REPORT_URL" ]] && LINES+=("- **Report:** [full report](${REPORT_URL})")
+        [[ -n "$REPORT_JSON_URL" ]] && LINES+=("- **AI-readable JSON:** [report.json](${REPORT_JSON_URL})")
+        LINES+=("- [Workflow run](https://github.com/${REPO}/actions/runs/${RUN_ID})")
         # Always-on interpretation note so reviewers don't treat every diff as a regression.
-        NOTE_FIELD=",{\"title\": \"VRT interpretation note\", \"value\": \"Visual Regression Test results are data points, not automatic pass or fail decisions. Content-driven differences such as dates, events, stories, and feed updates are often expected.\\n\\nReviewers should prioritize unintended structural or styling regressions, layout shifts, accessibility-impacting changes, and interaction breakage.\", \"short\": false}"
+        LINES+=("" "_VRT results are data points, not automatic pass or fail decisions. Content-driven differences (dates, events, stories, feed updates) are often expected: prioritise unintended structural or styling regressions, layout shifts, accessibility-impacting changes and interaction breakage._")
 
-        curl -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-          -H 'Content-type: application/json; charset=utf-8' \
-          --data "{
-            \"channel\": \"${SLACK_CHANNEL}\",
-            \"text\": \"${STATUS_EMOJI} Visual Regression Test — ${STATUS_TEXT}\",
-            \"attachments\": [{
-              \"color\": \"${STATUS_COLOR}\",
-              \"fields\": [
-                {\"title\": \"Site\",        \"value\": \"${PANTHEON_SITE}\", \"short\": true},
-                {\"title\": \"Environment\", \"value\": \"${TARGET_ENV}\",    \"short\": true},
-                {\"title\": \"Results\",     \"value\": \"${PASS_COUNT} passed, ${FAIL_COUNT} failed (threshold ${THRESHOLD}%)\", \"short\": false}
-                ${PR_FIELD}
-                ${REPORT_FIELD}
-                ${REPORT_JSON_FIELD}
-                ${NOTE_FIELD}
-              ],
-              \"footer\": \"GitHub Actions\",
-              \"ts\": $(date +%s)
-            }]
-          }" \
-          https://slack.com/api/chat.postMessage
+        {
+          echo 'body<<__CLICKUP_MSG__'
+          printf '%s\n' "${LINES[@]}"
+          echo '__CLICKUP_MSG__'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Post to ClickUp channel
+      if: steps.notify_message.outcome == 'success'
+      uses: Square360/shared-workflows/.github/actions/clickup-notify@v4  # moving major tag; new in 4.15.0
+      with:
+        channel_id: ${{ vars.CLICKUP_CHANNEL_ID }}
+        token: ${{ env.CLICKUP_API_TOKEN }}
+        workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+        message: ${{ steps.notify_message.outputs.body }}

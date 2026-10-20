@@ -72,7 +72,7 @@ on:
         type: string
         default: ''
       slack_channel:
-        description: 'Slack channel for FAILURE notifications only (quiet on green — the deploy notice already announces the env). Empty = no Slack.'
+        description: 'DEPRECATED, ignored. Notifications go to the ClickUp channel in the CLICKUP_CHANNEL_ID repository variable. Kept so callers that still pass it do not fail; removed in v5.'
         required: false
         type: string
         default: ''
@@ -111,7 +111,8 @@ jobs:
         env:
           PANTHEON_MACHINE_TOKEN: op://s360-cicd/pantheon/machine-token
           PANTHEON_SSH_KEY: op://s360-cicd/pantheon/ssh-key
-          SLACK_BOT_TOKEN: op://s360-cicd/slack/bot-token
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
       # terminus drush executes over SSH to the appserver — the machine token
       # alone is not enough (first guinea-pig run: "Permission denied
@@ -282,15 +283,14 @@ jobs:
           echo "route smoke: $CHECKED routes clean on $TARGET_URL"
 
       # Failure-only by design: green smoke adds nothing actionable and the
-      # deploy's own Slack notice already announces the environment.
-      - name: Notify Slack on failure
+      # deploy's own channel notice already announces the environment.
+      - name: Build ClickUp failure message
+        id: notify_message
         if: >
           failure() &&
           steps.routes_check.outputs.enabled == 'true' &&
-          inputs.slack_channel != ''
+          vars.CLICKUP_CHANNEL_ID != ''
         env:
-          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ inputs.slack_channel }}
           SITE: ${{ inputs.pantheon_site }}
           TARGET_ENV: ${{ inputs.target_env }}
           FAILED_ROUTES: ${{ steps.smoke.outputs.failed_routes }}
@@ -300,13 +300,25 @@ jobs:
           if [[ -n "$FAILED_ROUTES" ]]; then
             DETAIL=$(printf '%b' "$FAILED_ROUTES")
           else
-            DETAIL="smoke run failed before route checks (uli/session/url stage) — see the run log"
+            DETAIL="smoke run failed before route checks (uli/session/url stage), see the run log"
           fi
-          export SLACK_TEXT=$(printf ':rotating_light: *Route smoke FAILED* on `%s.%s` (%s routes checked)\n%s\n<%s|Run log>' "$SITE" "$TARGET_ENV" "${CHECKED:-0}" "$DETAIL" "$RUN_URL")
-          PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"channel": os.environ["SLACK_CHANNEL"], "text": os.environ["SLACK_TEXT"]}))')
-          curl -s --max-time 30 -X POST \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            --data "$PAYLOAD" \
-            https://slack.com/api/chat.postMessage >/dev/null || true
+          LINES=("🚨 **Route smoke FAILED** · \`${SITE}.${TARGET_ENV}\` (${CHECKED:-0} routes checked)" "")
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && LINES+=("- ${line}")
+          done <<< "$DETAIL"
+          LINES+=("- [Run log](${RUN_URL})")
 
+          {
+            echo 'body<<__CLICKUP_MSG__'
+            printf '%s\n' "${LINES[@]}"
+            echo '__CLICKUP_MSG__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to ClickUp channel
+        if: failure() && steps.notify_message.outcome == 'success'
+        uses: Square360/shared-workflows/.github/actions/clickup-notify@v4  # moving major tag; new in 4.15.0
+        with:
+          channel_id: ${{ vars.CLICKUP_CHANNEL_ID }}
+          token: ${{ env.CLICKUP_API_TOKEN }}
+          workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+          message: ${{ steps.notify_message.outputs.body }}

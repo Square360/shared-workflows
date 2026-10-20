@@ -6,7 +6,7 @@ Reusable GitHub Actions workflows and composite actions for Square360's Pantheon
 
 | Workflow | Runs when | Does |
 |---|---|---|
-| `reusable-pantheon-deploy-dev.yml` | release PR merges to master/main | semantic-release, push to DEV, LIVE backup (verified by listing), `drush deploy`, Slack |
+| `reusable-pantheon-deploy-dev.yml` | release PR merges to master/main | semantic-release, push to DEV, LIVE backup (verified by listing), `drush deploy`, ClickUp channel notice |
 | `reusable-pantheon-deploy-pr-multidev.yml` | PR opened/updated | `pr-NNN` multidev, php-quality, route-smoke, opt-in ZAP + VRT |
 | `reusable-pantheon-deploy-rc-multidev.yml` | PR merged to develop (real merges only) | `rc-YYYY-WW` multidev, composer-audit gate, route-smoke, ZAP, opt-in VRT |
 | `reusable-pantheon-deploy-epic-multidev.yml` | push to `epic/**` | `epr-*` multidev, ZAP gate |
@@ -30,7 +30,7 @@ Each file's header comment is the reference for its inputs, gates, labels and sk
 ## What a client repo needs
 
 - **One secret:** `OP_SERVICE_ACCOUNT_TOKEN` (org-level). Every other credential is read from the 1Password `s360-cicd` vault at run time; nothing else is stored in GitHub.
-- **Three variables:** `PANTHEON_SITE`, `SLACK_CHANNEL`, `WORKFLOW_SKIP_TERMINUS`.
+- **Three variables:** `PANTHEON_SITE`, `CLICKUP_CHANNEL_ID` (the client's ClickUp `[internal]` chat channel; every reusable reads it directly), `WORKFLOW_SKIP_TERMINUS`. `SLACK_CHANNEL` is no longer read.
 - **The callers,** installed and kept current by `composer require square360/pantheon-github-workflows`.
 - **Optional:** `COMPOSER_AUDIT_GATE=false` turns the composer audit gate (RC and DEV deploy) into a warning, for a deliberate override mid-incident; delete the variable afterwards.
 - **Optional:** `S360_RUNNER_LABEL` overrides the runner image for every job (default `ubuntu-latest`). Set it on one repo to try a new image (`ubuntu-26.04`), or at org level to roll the whole fleet back (`ubuntu-24.04`) without a release.
