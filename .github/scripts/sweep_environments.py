@@ -20,7 +20,8 @@ lacks admin, which looks like "already gone":
     there means a permission problem, so that repo stops and the run fails;
     gone means it vanished meanwhile, so the sweep carries on
 
-Env: GH_TOKEN, DRY_RUN ("true"/"false"), CONFIG (path to env-sweep.json).
+Env: GH_TOKEN, DRY_RUN ("true"/"false"), CONFIG (path to env-sweep.json),
+CHAT_MESSAGE_FILE (optional: where to write the ClickUp chat message).
 """
 import datetime
 import json
@@ -131,7 +132,9 @@ def main():
 
     status, installed = paged("/installation/repositories", key="repositories")
     if status != 200:
-        print(f"::error::Cannot list the App installation's repositories (HTTP {status}).")
+        msg = f"Cannot list the App installation's repositories (HTTP {status})."
+        print(f"::error::{msg}")
+        fail_chat(msg)
         return 1
     by_name = {r["full_name"].lower(): r for r in installed}
 
@@ -150,9 +153,11 @@ def main():
     if targets:
         status, _, _ = api("GET", f"/repos/{targets[0]}/environments?per_page=1")
         if status in (403, 404):
-            print(f"::error::The App token cannot list environments (HTTP {status} on "
-                  f"{targets[0]}). Listing needs the App's Actions: read permission; "
-                  "deleting needs Administration: write.")
+            msg = (f"The App token cannot list environments (HTTP {status} on "
+                   f"{targets[0]}). Listing needs the App's Actions: read permission; "
+                   "deleting needs Administration: write.")
+            print(f"::error::{msg}")
+            fail_chat(msg)
             return 1
     for name in targets:
         results.append(sweep(name, this_week))
@@ -190,7 +195,33 @@ def main():
     fatal = [r for r in results if r["fatal"]]
     for r in fatal:
         print(f"::error title={r['repo']}::{r['problem']}")
+    write_chat(results, fatal, total, verb)
     return 1 if fatal else 0
+
+
+def write_chat(results, fatal, total, verb):
+    """Short ClickUp chat message; empty (no post) when nothing happened."""
+    path = os.environ.get("CHAT_MESSAGE_FILE")
+    if not path or (total == 0 and not fatal):
+        return
+    run = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+           f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}")
+    head = f"**Stale GitHub environment sweep**: {verb.lower()} {total}"
+    per = [f"{r['repo'].split('/')[-1]} {len(r['deleted'])}" for r in results if r["deleted"]]
+    lines = [head + (f" ({', '.join(per)})" if per else "") + "."]
+    for r in fatal:
+        lines.append(f"- Problem on `{r['repo']}`: {r['problem']}")
+    lines.append(f"[Run summary]({run})")
+    open(path, "w").write("\n".join(lines) + "\n")
+
+
+def fail_chat(message):
+    """Run-level failure (token can't list, installation unreadable)."""
+    path = os.environ.get("CHAT_MESSAGE_FILE")
+    if path:
+        run = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+               f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}")
+        open(path, "w").write(f"**Stale GitHub environment sweep failed**: {message}\n[Run]({run})\n")
 
 
 if __name__ == "__main__":

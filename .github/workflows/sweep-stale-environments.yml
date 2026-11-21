@@ -64,6 +64,8 @@ jobs:
           export-env: true
         env:
           SWEEPER_APP_PRIVATE_KEY: op://s360-cicd/github-app-env-sweeper/private-key
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
 
       # Permission check 1: asking for exactly these permissions makes the mint
       # fail here, before any repo is touched, if the App doesn't have them.
@@ -83,8 +85,34 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           CONFIG: .github/env-sweep.json
+          CHAT_MESSAGE_FILE: ${{ runner.temp }}/chat-message.md
           DRY_RUN: >-
             ${{ github.event_name == 'pull_request' && 'true'
              || github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false')
              || (vars.ENV_SWEEP_DELETE == 'true' && 'false' || 'true') }}
         run: python3 .github/scripts/sweep_environments.py
+
+      # Posts to the "Dev Management" ClickUp channel when something was
+      # deleted or went wrong; quiet weeks and PR dry runs post nothing.
+      - name: Read chat message
+        id: chat
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          f="${RUNNER_TEMP}/chat-message.md"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ ! -s "$f" && "${{ job.status }}" == "failure" ]]; then
+            # Failed before the sweep wrote anything (secrets, token mint).
+            printf '**Stale GitHub environment sweep failed** before it could run (secrets or App token step).\n[Run](%s)\n' "$RUN_URL" > "$f"
+          fi
+          if [[ -s "$f" ]]; then
+            { echo "body<<CHAT_EOF"; cat "$f"; echo "CHAT_EOF"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post to Dev Management
+        if: always() && steps.chat.outputs.body != ''
+        uses: ./.github/actions/clickup-notify
+        with:
+          channel_id: '12b9zb-89711'
+          token: ${{ env.CLICKUP_API_TOKEN }}
+          workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+          message: ${{ steps.chat.outputs.body }}
