@@ -92,7 +92,7 @@ jobs:
              || (vars.ENV_SWEEP_DELETE == 'true' && 'false' || 'true') }}
         run: python3 .github/scripts/sweep_environments.py
 
-      # Posts to the "Dev Management" ClickUp channel when something was
+      # Posts to the "systems_monitoring" ClickUp channel when something was
       # deleted or went wrong; quiet weeks and PR dry runs post nothing.
       - name: Read chat message
         id: chat
@@ -108,11 +108,11 @@ jobs:
             { echo "body<<CHAT_EOF"; cat "$f"; echo "CHAT_EOF"; } >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Post to Dev Management
+      - name: Post to systems_monitoring
         if: always() && steps.chat.outputs.body != ''
         uses: ./.github/actions/clickup-notify
         with:
-          channel_id: '12b9zb-89711'
+          channel_id: '12b9zb-90951'
           token: ${{ env.CLICKUP_API_TOKEN }}
           workspace_id: ${{ env.CLICKUP_TEAM_ID }}
           message: ${{ steps.chat.outputs.body }}
