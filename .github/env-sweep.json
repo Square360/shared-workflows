@@ -1,0 +1,8 @@
+{
+  "exclude": [
+    "Square360/The-Common-Gear"
+  ],
+  "also_check": [
+    "yalesites-org/ysph"
+  ]
+}
