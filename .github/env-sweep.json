@@ -3,7 +3,8 @@
     "Square360/The-Common-Gear"
   ],
   "security_watch_exclude": [
-    "Square360/heimels-personal"
+    "Square360/heimels-personal",
+    "Square360/Newpoint-Drupal"
   ],
   "also_check": [
     "yalesites-org/ysph"
