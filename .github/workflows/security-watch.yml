@@ -1,0 +1,135 @@
+name: Security watch
+
+# -----------------------------------------------------------------------------
+# Daily Drupal security watch (issue #187). Posts to the ClickUp "Development"
+# channel when there is something new at Critical or Highly Critical:
+#   - a drupal.org core advisory, with the sites still exposed
+#   - a contrib or library advisory that one of our sites' default-branch
+#     composer.lock is exposed to
+#   - any drupal.org PSA (advance notice of a core or contrib release window)
+# Moderately critical and below ride routine releases and are never posted.
+# Silent when nothing is new; each advisory posts once (state in the Actions
+# cache).
+#
+# Runs as the read-only "Square360 Security Watch" App (Contents: read),
+# installed on all Square360 repos. Uses the environment sweep's exclude list
+# (.github/env-sweep.json). yalesom repos are outside the App; core advisories
+# still reach the channel from the feed.
+# -----------------------------------------------------------------------------
+
+on:
+  schedule:
+    - cron: '0 12 * * *'   # daily 12:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report in the run summary only: no ClickUp post, no state saved'
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - '.github/workflows/security-watch.yml'
+      - '.github/scripts/security_watch.py'
+      - '.github/env-sweep.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-watch
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch:
+    name: Watch
+    runs-on: ${{ vars.S360_RUNNER_LABEL || 'ubuntu-latest' }}
+    env:
+      DRY_RUN: >-
+        ${{ github.event_name == 'pull_request' && 'true'
+         || github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false')
+         || 'false' }}
+      STATE_FILE: ${{ github.workspace }}/.security-watch-state.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP and Composer
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer
+          coverage: none
+
+      - name: Restore posted-advisory state
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STATE_FILE }}
+          key: security-watch-state-${{ github.run_id }}
+          restore-keys: security-watch-state-
+
+      - name: Configure 1Password
+        uses: 1password/load-secrets-action/configure@v5
+        with:
+          service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Load secrets
+        uses: 1password/load-secrets-action@v5
+        with:
+          export-env: true
+        env:
+          WATCH_APP_PRIVATE_KEY: op://s360-cicd/github-app-security-watch/private-key
+          CLICKUP_API_TOKEN: op://s360-cicd/clickup/api-token
+          CLICKUP_TEAM_ID: op://s360-cicd/clickup/team-id
+
+      # Requesting exactly contents:read makes the mint fail here if the App
+      # lacks it. The Client ID is public (the App's OAuth identifier).
+      - name: Mint Security Watch App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: Iv23li0XqkJnMJb60R20
+          private-key: ${{ env.WATCH_APP_PRIVATE_KEY }}
+          owner: Square360
+          permission-contents: read
+
+      - name: Watch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CONFIG: .github/env-sweep.json
+          CHAT_MESSAGE_FILE: ${{ runner.temp }}/chat-message.md
+        run: python3 .github/scripts/security_watch.py
+
+      - name: Save posted-advisory state
+        if: success() && env.DRY_RUN == 'false'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STATE_FILE }}
+          key: security-watch-state-${{ github.run_id }}
+
+      - name: Read chat message
+        id: chat
+        if: always() && env.DRY_RUN == 'false'
+        run: |
+          f="${RUNNER_TEMP}/chat-message.md"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ ! -s "$f" && "${{ job.status }}" == "failure" ]]; then
+            printf '**Drupal security watch failed**, so today'"'"'s advisories were not checked.\n[Run](%s)\n' "$RUN_URL" > "$f"
+          fi
+          if [[ -s "$f" ]]; then
+            { echo "body<<CHAT_EOF"; cat "$f"; echo "CHAT_EOF"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post to Development
+        if: always() && steps.chat.outputs.body != ''
+        uses: ./.github/actions/clickup-notify
+        with:
+          channel_id: '12b9zb-88171'
+          token: ${{ env.CLICKUP_API_TOKEN }}
+          workspace_id: ${{ env.CLICKUP_TEAM_ID }}
+          message: ${{ steps.chat.outputs.body }}
