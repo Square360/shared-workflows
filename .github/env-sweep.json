@@ -2,6 +2,9 @@
   "exclude": [
     "Square360/The-Common-Gear"
   ],
+  "security_watch_exclude": [
+    "Square360/heimels-personal"
+  ],
   "also_check": [
     "yalesites-org/ysph"
   ]
