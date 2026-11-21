@@ -1,3 +1,9 @@
+# Release 4.17.0 (2026-11-21)
+
+### Features
+
+* daily security watch to the ClickUp Development channel (#188) (c40e73f)
+
 # Release 4.16.0 (2026-11-21)
 
 ### Features
