@@ -1,3 +1,9 @@
+# Release 4.16.0 (2026-11-21)
+
+### Features
+
+* weekly sweep of stale GitHub deployment environments (#186) (7f7d79e)
+
 # Release 4.15.0 (2026-10-20)
 
 ### Features
