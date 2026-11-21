@@ -104,8 +104,10 @@ def audit_repo(repo, branch):
         # site's private repositories.
         json.dump({"repositories": [{"type": "composer", "url": "https://packages.drupal.org/8"}]},
                   open(f"{d}/composer.json", "w"))
-        r = subprocess.run(["composer", "audit", "--locked", "--format=json", "--no-interaction",
-                            "--no-plugins", "--abandoned=ignore"],
+        # --no-dev: deploys run `composer install --no-dev`, so require-dev
+        # packages never reach Pantheon and aren't exposure.
+        r = subprocess.run(["composer", "audit", "--locked", "--no-dev", "--format=json",
+                            "--no-interaction", "--no-plugins", "--abandoned=ignore"],
                            cwd=d, capture_output=True, text=True, timeout=180)
     try:
         data = json.loads(r.stdout or "{}")
