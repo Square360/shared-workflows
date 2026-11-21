@@ -13,6 +13,8 @@ lacks admin, which looks like "already gone":
   - repos come from the App installation, so an uncovered repo is never tried;
     repos in `also_check` that the App can't reach are reported, not attempted
   - archived repos are skipped (they refuse writes)
+  - one probe before the loop: a token that can't list environments (needs
+    Actions: read) fails the run once, before any repo is swept
   - a repo whose environments can't be listed is reported and skipped
   - on the first failed delete in a repo, the environment is re-read: still
     there means a permission problem, so that repo stops and the run fails;
@@ -133,7 +135,7 @@ def main():
         return 1
     by_name = {r["full_name"].lower(): r for r in installed}
 
-    results, skipped = [], []
+    results, skipped, targets = [], [], []
     for r in sorted(installed, key=lambda r: r["full_name"].lower()):
         name = r["full_name"]
         if name.lower() in EXCLUDE:
@@ -141,7 +143,19 @@ def main():
         elif r.get("archived"):
             skipped.append((name, "archived (refuses writes)"))
         else:
-            results.append(sweep(name, this_week))
+            targets.append(name)
+
+    # Permission check: one probe before the loop, so a token that can't read
+    # environments fails once with a clear message instead of once per repo.
+    if targets:
+        status, _, _ = api("GET", f"/repos/{targets[0]}/environments?per_page=1")
+        if status in (403, 404):
+            print(f"::error::The App token cannot list environments (HTTP {status} on "
+                  f"{targets[0]}). Listing needs the App's Actions: read permission; "
+                  "deleting needs Administration: write.")
+            return 1
+    for name in targets:
+        results.append(sweep(name, this_week))
     for name in ALSO_CHECK:
         if name.lower() not in by_name:
             skipped.append((name, "App not installed there: needs that repo's owner to clean up"))

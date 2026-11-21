@@ -6,9 +6,10 @@ name: Sweep stale GitHub environments
 # everything else, epr-* included. GitHub records only: Pantheon multidevs are
 # never touched (their lifecycle stays manual).
 #
-# Runs as the "Square360 Env Sweeper" App (Administration: write, Pull
-# requests: read), installed on all Square360 repos. Its key is used by this
-# workflow only; the Square360 CI App stays contents-only.
+# Runs as the "Square360 Env Sweeper" App (Actions: read to list
+# environments, Administration: write to delete, Pull requests: read),
+# installed on all Square360 repos. Its key is used by this workflow only;
+# the Square360 CI App stays contents-only.
 #
 # Scheduled runs only report until the repository variable ENV_SWEEP_DELETE is
 # set to "true". Manual runs default to dry run. PRs touching the sweep always
@@ -74,6 +75,7 @@ jobs:
           client-id: Iv23liBdf82AGbhimSoU
           private-key: ${{ env.SWEEPER_APP_PRIVATE_KEY }}
           owner: Square360
+          permission-actions: read
           permission-administration: write
           permission-pull-requests: read
 
