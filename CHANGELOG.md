@@ -1,3 +1,9 @@
+# Release 4.17.2 (2026-11-23)
+
+### Bug Fixes
+
+* route-smoke: a per-route timeout names the route and the run continues; budget 45s (#182) (8bfa28c)
+
 # Release 4.17.1 (2026-11-23)
 
 ### Bug Fixes
