@@ -1,3 +1,9 @@
+# Release 4.17.1 (2026-11-23)
+
+### Bug Fixes
+
+* security-scan: replace the ZAP report by rename in the PII filter (#184) (dee33f7)
+
 # Release 4.17.0 (2026-11-21)
 
 ### Features
