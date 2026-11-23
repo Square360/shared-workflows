@@ -255,6 +255,9 @@ jobs:
 
           FAIL=0
           CHECKED=0
+          # Per-route budget. 30s was too short for cold admin pages on a
+          # multidev (/admin/reports/dblog took 33.5s on Economics, #182).
+          ROUTE_MAX_TIME=45
           while IFS= read -r line; do
             line="${line%%#*}"
             line=$(echo "$line" | xargs || true)
@@ -262,8 +265,18 @@ jobs:
             ROUTE=$(echo "$line" | awk '{print $1}')
             EXPECTED=$(echo "$line" | awk '{print $2}')
             EXPECTED="${EXPECTED:-200}"
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${CURL_AUTH[@]}" -c "$JAR" -b "$JAR" "$TARGET_URL$ROUTE")
+            # Capture curl's exit code: under `bash -e` a bare timeout (exit
+            # 28) would end the script here, before the route is recorded.
+            CURL_RC=0
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$ROUTE_MAX_TIME" "${CURL_AUTH[@]}" -c "$JAR" -b "$JAR" "$TARGET_URL$ROUTE") || CURL_RC=$?
             CHECKED=$((CHECKED+1))
+            if [[ "$CURL_RC" -ne 0 ]]; then
+              if [[ "$CURL_RC" -eq 28 ]]; then GOT="timeout after ${ROUTE_MAX_TIME}s"; else GOT="curl exit $CURL_RC"; fi
+              echo "::error::route smoke FAILED: $ROUTE expected $EXPECTED, got $GOT"
+              FAILED_LIST="${FAILED_LIST}${ROUTE} (expected ${EXPECTED}, got ${GOT})\n"
+              FAIL=1
+              continue
+            fi
             if [[ "$CODE" == "$EXPECTED" ]]; then
               echo "✓ $ROUTE → $CODE"
             else
