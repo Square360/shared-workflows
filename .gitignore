@@ -25,3 +25,7 @@ package-lock.json
 .env
 .claude
 /_working
+
+# Python bytecode cache
+__pycache__/
+*.pyc
