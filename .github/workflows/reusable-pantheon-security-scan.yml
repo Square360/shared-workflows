@@ -402,7 +402,11 @@ jobs:
               | map(select(.pluginid != "10062" or ((.instances // []) | length) > 0))
             )
           )
-        ' report_json.raw.json > "$REPORT"
+        ' report_json.raw.json > "${REPORT}.filtered"
+        # ZAP runs in Docker, so report_json.json belongs to the container
+        # user and the runner cannot truncate it. Replace it by rename, which
+        # only needs a writable directory.
+        mv -f "${REPORT}.filtered" "$REPORT"
         REMAINING=$(jq '[.site[]?.alerts[]? | select(.pluginid == "10062") | (.instances // [])[]] | length' "$REPORT")
         echo "PII verification: dropped ${DROPPED} verified-false-positive instance(s), kept ${REMAINING}; raw report preserved as report_json.raw.json"
         rm -f "$DROPS"
