@@ -1,3 +1,9 @@
+# Release 4.17.3 (2026-11-23)
+
+### Chores
+
+* untrack Python bytecode and ignore __pycache__ (e3de325)
+
 # Release 4.17.2 (2026-11-23)
 
 ### Bug Fixes
